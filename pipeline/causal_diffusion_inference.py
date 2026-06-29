@@ -110,6 +110,15 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             "multi_shot_rope_offset",
             0.0,
         )
+        self.refer_sink_swap = section_get(args, "inference", "refer_sink_swap", False)
+        self.refer_sink_after_chunks = int(section_get(args, "inference", "refer_sink_after_chunks", 1))
+        self.refer_sink_injection_chunks = int(section_get(args, "inference", "refer_sink_injection_chunks", 1))
+        self.refer_sink_start_slot = int(section_get(args, "inference", "refer_sink_start_slot", 0))
+        self.refer_sink_num_slots = int(section_get(args, "inference", "refer_sink_num_slots", 2))
+        self.refer_sink_mode = section_get(args, "inference", "refer_sink_mode", "repeat_first")
+        self.refer_sink_rope_start_frame = int(section_get(args, "inference", "refer_sink_rope_start_frame", 0))
+        self.refer_sink_target = section_get(args, "inference", "refer_sink_target", "shot")
+        self.refer_sink_restore = section_get(args, "inference", "refer_sink_restore", True)
         self.guidance_scale = section_get(args, "inference", "guidance_scale", getattr(args, "guidance_scale", 1.0))
         self.negative_prompt = section_get(args, "inference", "negative_prompt", getattr(args, "negative_prompt", ""))
         self.streaming_vae = section_get(args, "inference", "streaming_vae", getattr(args, "streaming_vae", False))
@@ -169,6 +178,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         noise: torch.Tensor,
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
+        refer_latents: Optional[list] = None,
         return_latents: bool = False,
         start_frame_index: Optional[int] = 0
     ) -> torch.Tensor:
@@ -336,6 +346,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 conditional_dict_list=conditional_dict_list,
                 unconditional_dict=unconditional_dict,
                 use_cfg=use_cfg, initial_latent=initial_latent,
+                refer_latents=refer_latents,
                 clamp_i2v_first_chunk=clamp_i2v_first_chunk,
                 return_latents=return_latents,
                 current_start_frame=current_start_frame,
@@ -370,7 +381,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self, noise, batch_size, num_frames, num_channels, height, width,
         num_blocks, num_input_frames, num_output_frames, output,
         conditional_dict, conditional_dict_list, unconditional_dict,
-        use_cfg, initial_latent, clamp_i2v_first_chunk, return_latents,
+        use_cfg, initial_latent, refer_latents, clamp_i2v_first_chunk, return_latents,
         current_start_frame, cache_start_frame,
         raw_prompts=None,
     ):
@@ -553,6 +564,22 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 print(f"[inference] multi-shot RoPE: shot_index={current_shot_index}, "
                       f"temporal_offset={self._dit_model.rope_temporal_offset:.4f}")
 
+            refer_restore = None
+            if self._should_apply_refer_sink(chunk_index, raw_prompts, refer_latents):
+                chunk_refers = refer_latents[chunk_index]
+                if chunk_refers:
+                    refer_restore = self._apply_refer_sink_swap(
+                        chunk_refers=chunk_refers,
+                        conditional_dict=conditional_dict,
+                        unconditional_dict=unconditional_dict,
+                        use_cfg=use_cfg,
+                        batch_size=batch_size,
+                        dtype=noise.dtype,
+                        device=noise.device,
+                        shot_index=current_shot_index,
+                        chunk_index=chunk_index,
+                    )
+
             first_i2v_block = clamp_i2v_first_chunk and chunk_index == 0
             noise_start_frame = (
                 cache_start_frame
@@ -696,6 +723,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     video_chunks.append(decoded_chunk.cpu())
                     del decoded_chunk, chunk_bcthw
                     torch.cuda.empty_cache()
+
+            if refer_restore is not None and self.refer_sink_restore:
+                self._restore_refer_sink_slots(refer_restore)
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
@@ -881,6 +911,26 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.crossattn_cache_pos = crossattn_cache_pos  # always store the clean cache
         self.crossattn_cache_neg = crossattn_cache_neg  # always store the clean cache
 
+    def _clone_empty_kv_cache(self, dtype, device):
+        if self.quantize_kv:
+            raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
+        kv_cache = []
+        for block_cache in self.kv_cache_pos:
+            kv_cache.append({
+                "k": torch.zeros_like(block_cache["k"], dtype=dtype, device=device),
+                "v": torch.zeros_like(block_cache["v"], dtype=dtype, device=device),
+                "quantized": False,
+                "block_token_size": block_cache["block_token_size"],
+                "max_blocks": block_cache["max_blocks"],
+                "num_heads": block_cache["num_heads"],
+                "num_filled_blocks": 0,
+                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
+                "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+            })
+        return kv_cache
+
     def clear_cache(self):
         """
         Explicitly release large KV / cross-attention caches to free GPU memory.
@@ -997,6 +1047,159 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if not self.sink_size or self.sink_size == 0:
             return False
         return self._is_shot_boundary(raw_prompts, chunk_index)
+
+    def _shot_start_for_chunk(self, raw_prompts, chunk_index):
+        shot_start = 0
+        for i in range(1, chunk_index + 1):
+            if self._is_shot_boundary(raw_prompts, i):
+                shot_start = i
+        return shot_start
+
+    def _should_apply_refer_sink(self, chunk_index, raw_prompts, refer_latents):
+        if not self.refer_sink_swap:
+            return False
+        if refer_latents is None or chunk_index >= len(refer_latents):
+            return False
+        if not self.multi_shot_sink or not self.sink_size:
+            return False
+        shot_start = self._shot_start_for_chunk(raw_prompts, chunk_index)
+        chunk_in_shot = chunk_index - shot_start
+        if chunk_in_shot < self.refer_sink_after_chunks:
+            return False
+        if chunk_in_shot >= self.refer_sink_after_chunks + self.refer_sink_injection_chunks:
+            return False
+        return bool(refer_latents[chunk_index])
+
+    def _make_refer_latent_for_slots(self, refer_latent, num_slots):
+        if refer_latent.ndim != 5:
+            raise ValueError(f"refer latent must have shape [B,T,C,H,W], got {tuple(refer_latent.shape)}")
+        if refer_latent.shape[1] >= num_slots:
+            return refer_latent[:, :num_slots]
+        if self.refer_sink_mode == "cycle":
+            indices = torch.arange(num_slots, device=refer_latent.device) % refer_latent.shape[1]
+            return refer_latent.index_select(1, indices)
+        if self.refer_sink_mode != "repeat_first":
+            raise ValueError(f"Unsupported refer_sink_mode={self.refer_sink_mode!r}")
+        return refer_latent[:, :1].repeat(1, num_slots, 1, 1, 1)
+
+    def _snapshot_kv_slots(self, kv_cache, dst_slice):
+        return [(block_cache["k"][:, dst_slice].clone(), block_cache["v"][:, dst_slice].clone())
+                for block_cache in kv_cache]
+
+    def _restore_kv_slots(self, kv_cache, dst_slice, snapshot):
+        for block_cache, (k_saved, v_saved) in zip(kv_cache, snapshot):
+            block_cache["k"][:, dst_slice] = k_saved
+            block_cache["v"][:, dst_slice] = v_saved
+
+    def _apply_refer_sink_swap(
+        self,
+        chunk_refers,
+        conditional_dict,
+        unconditional_dict,
+        use_cfg,
+        batch_size,
+        dtype,
+        device,
+        shot_index,
+        chunk_index,
+    ):
+        if self.quantize_kv:
+            raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
+        if self.refer_sink_target not in {"shot", "global"}:
+            raise ValueError(f"refer_sink_target must be 'shot' or 'global', got {self.refer_sink_target!r}")
+
+        refer = chunk_refers[0]
+        refer_latent = refer["latent"].to(device=device, dtype=dtype)
+        if refer_latent.shape[0] == 1 and batch_size > 1:
+            refer_latent = refer_latent.repeat(batch_size, 1, 1, 1, 1)
+
+        max_slots = max(0, self.sink_size - self.refer_sink_start_slot)
+        num_slots = min(self.refer_sink_num_slots, max_slots)
+        if num_slots <= 0:
+            return None
+        refer_latent = self._make_refer_latent_for_slots(refer_latent, num_slots)
+
+        temp_pos = self._clone_empty_kv_cache(dtype=dtype, device=device)
+        temp_neg = self._clone_empty_kv_cache(dtype=dtype, device=device) if use_cfg else None
+        temp_cross_pos = [
+            {key: (value.clone() if torch.is_tensor(value) else value) for key, value in cache.items()}
+            for cache in self.crossattn_cache_pos
+        ]
+        for cache in temp_cross_pos:
+            cache["is_init"] = False
+        temp_cross_neg = [
+            {key: (value.clone() if torch.is_tensor(value) else value) for key, value in cache.items()}
+            for cache in self.crossattn_cache_neg
+        ] if use_cfg else None
+        if temp_cross_neg is not None:
+            for cache in temp_cross_neg:
+                cache["is_init"] = False
+
+        dit = self._dit_model
+        prev_rope_temporal_offset = getattr(dit, "rope_temporal_offset", 0.0)
+        timestep = torch.zeros([batch_size, num_slots], device=device, dtype=torch.float32)
+        try:
+            dit.rope_temporal_offset = float(self.refer_sink_rope_start_frame)
+            self.generator(
+                noisy_image_or_video=refer_latent,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+                kv_cache=temp_pos,
+                crossattn_cache=temp_cross_pos,
+                current_start=self.refer_sink_rope_start_frame * self.frame_seq_length,
+                cache_start=0,
+            )
+            if use_cfg:
+                self.generator(
+                    noisy_image_or_video=refer_latent,
+                    conditional_dict=unconditional_dict,
+                    timestep=timestep,
+                    kv_cache=temp_neg,
+                    crossattn_cache=temp_cross_neg,
+                    current_start=self.refer_sink_rope_start_frame * self.frame_seq_length,
+                    cache_start=0,
+                )
+        finally:
+            dit.rope_temporal_offset = prev_rope_temporal_offset
+
+        if self.refer_sink_target == "global":
+            dst_start = self.refer_sink_start_slot * self.frame_seq_length
+        else:
+            pin_start = int(self.kv_cache_pos[0]["pinned_start"].item())
+            if pin_start < 0:
+                print(f"[refer-sink][skip] shot sink is not pinned yet at chunk={chunk_index}")
+                return None
+            dst_start = pin_start + self.refer_sink_start_slot * self.frame_seq_length
+
+        copy_tokens = num_slots * self.frame_seq_length
+        dst_slice = slice(dst_start, dst_start + copy_tokens)
+        src_slice = slice(0, copy_tokens)
+        restore = []
+        for active_cache, temp_cache, name in (
+            (self.kv_cache_pos, temp_pos, "pos"),
+            (self.kv_cache_neg, temp_neg, "neg"),
+        ):
+            if active_cache is None or temp_cache is None:
+                continue
+            snapshot = self._snapshot_kv_slots(active_cache, dst_slice) if self.refer_sink_restore else None
+            for active_block, temp_block in zip(active_cache, temp_cache):
+                active_block["k"][:, dst_slice] = temp_block["k"][:, src_slice]
+                active_block["v"][:, dst_slice] = temp_block["v"][:, src_slice]
+            restore.append((active_cache, dst_slice, snapshot, name))
+
+        image_path = refer.get("image_path", "<latent>")
+        print(
+            f"[refer-sink] shot={shot_index} chunk={chunk_index} target={self.refer_sink_target} "
+            f"image={image_path} slots={self.refer_sink_start_slot}:"
+            f"{self.refer_sink_start_slot + num_slots} tokens={dst_slice.start}:{dst_slice.stop} "
+            f"rope_start={self.refer_sink_rope_start_frame} restore={self.refer_sink_restore}"
+        )
+        return restore
+
+    def _restore_refer_sink_slots(self, restore):
+        for kv_cache, dst_slice, snapshot, _name in restore:
+            if snapshot is not None:
+                self._restore_kv_slots(kv_cache, dst_slice, snapshot)
 
     def _update_sink_for_scene_cut(self, kv_cache, current_num_frames):
         """Legacy copy-to-front sink relocation (used by training pipeline)."""
