@@ -69,25 +69,32 @@ Add these under LongLive2's inference config:
 ```yaml
 refer_sink_swap: false
 refer_sink_after_chunks: 1        # wait until this many chunks of the shot exist
-refer_sink_start_slot: 1          # keep slot 0 as generated anchor by default
-refer_sink_num_slots: 2           # with sink_size=3, swap slots 1 and 2
+refer_sink_injection_chunks: 1    # keep the subject KV swapped for this many chunks
+refer_sink_start_slot: 0          # SPAWN-aligned default; ablate against slot 1
+refer_sink_num_slots: 2           # with sink_size=8, swap slots 0 and 1
 refer_sink_mode: cycle            # cycle | repeat_first
 refer_sink_rope_start_frame: 0    # compact RoPE id for swapped refer slots
+refer_sink_rope_mode: aligned     # aligned | compact
+refer_sink_target: shot           # shot | global
+refer_sink_restore: true          # restore original sink KV after the injection window
 ```
 
 For the first experiment, use:
 
 ```yaml
 multi_shot_sink: true
-sink_size: 3
+sink_size: 8
 refer_sink_swap: true
 refer_sink_after_chunks: 1
-refer_sink_start_slot: 1
+refer_sink_injection_chunks: 1
+refer_sink_start_slot: 0
 refer_sink_num_slots: 2
 ```
 
-This mirrors the safer ShotStream setting: preserve the first generated sink
-slot and only replace the later sink slots after the shot-level sink exists.
+This keeps LongLive2's default `sink_size=8` and starts with a two-slot
+SPAWN-style subject KV swap. Ablate against the safer ShotStream setting
+(`refer_sink_start_slot: 1`) to test whether preserving the first generated
+sink slot is more stable than replacing the first two anchor slots.
 
 ### Suggested prompt / metadata format
 
@@ -131,6 +138,12 @@ the ShotStream refer-path behavior.
    - Copy only `refer_sink_start_slot : refer_sink_start_slot + refer_sink_num_slots`
      into the active shot/global sink cache.
    - Do not advance global/local cache pointers while copying swapped slots.
+   - Treat the swapped content as the subject image's KV cache, not raw pixels:
+     the reference image is first encoded as a latent, then recached at
+     timestep 0 with RoPE aligned to the target sink slots, and only its
+     generated K/V tensors are copied into the sink.
+   - When `refer_sink_restore` is true, keep the subject KV swapped only for
+     `refer_sink_injection_chunks` chunks, then restore the original sink KV.
 
 4. **RoPE / text routing**
    - Re-apply compact RoPE to swapped refer sink slots using
@@ -149,8 +162,8 @@ the ShotStream refer-path behavior.
 1. LongLive2 baseline I2V, no refer sink swap.
 2. LongLive2 multi-shot sink only.
 3. Refer sink swap at shot start, all sink slots (expected to over-condition).
-4. Delayed refer sink swap after one generated chunk, slots `1:3` only.
-5. Delayed refer sink swap after two generated chunks, slots `1:3` only.
+4. Delayed refer sink swap after one generated chunk, slots `0:2`.
+5. Delayed refer sink swap after one generated chunk, slots `1:3` only.
 6. Refer in global sink only vs shot sink only.
 
 The safest default to start with is experiment 4.
