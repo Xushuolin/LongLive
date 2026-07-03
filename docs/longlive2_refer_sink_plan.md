@@ -74,6 +74,7 @@ refer_sink_start_slot: 0          # SPAWN-aligned default; ablate against slot 1
 refer_sink_num_slots: 2           # with sink_size=8, swap slots 0 and 1
 refer_sink_mode: cycle            # cycle | repeat_first
 refer_sink_rope_start_frame: 0    # compact RoPE id for swapped refer slots
+refer_sink_rope_mode: aligned     # aligned | compact
 refer_sink_target: shot           # shot | global
 refer_sink_restore: true          # restore original sink KV after the injection window
 ```
@@ -138,8 +139,9 @@ the ShotStream refer-path behavior.
      into the active shot/global sink cache.
    - Do not advance global/local cache pointers while copying swapped slots.
    - Treat the swapped content as the subject image's KV cache, not raw pixels:
-     the reference image is first encoded as a latent, then recached with
-     compact RoPE, and only its generated K/V tensors are copied into the sink.
+     the reference image is first encoded as a latent, then recached at
+     timestep 0 with RoPE aligned to the target sink slots, and only its
+     generated K/V tensors are copied into the sink.
    - When `refer_sink_restore` is true, keep the subject KV swapped only for
      `refer_sink_injection_chunks` chunks, then restore the original sink KV.
 

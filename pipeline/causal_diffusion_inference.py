@@ -117,6 +117,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.refer_sink_num_slots = int(section_get(args, "inference", "refer_sink_num_slots", 2))
         self.refer_sink_mode = section_get(args, "inference", "refer_sink_mode", "repeat_first")
         self.refer_sink_rope_start_frame = int(section_get(args, "inference", "refer_sink_rope_start_frame", 0))
+        self.refer_sink_rope_mode = section_get(args, "inference", "refer_sink_rope_mode", "aligned")
         self.refer_sink_target = section_get(args, "inference", "refer_sink_target", "shot")
         self.refer_sink_restore = section_get(args, "inference", "refer_sink_restore", True)
         self.guidance_scale = section_get(args, "inference", "guidance_scale", getattr(args, "guidance_scale", 1.0))
@@ -265,6 +266,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_pos[block_index]["pinned_start"].fill_(-1)
                 self.kv_cache_pos[block_index]["pinned_len"].zero_()
+                self.kv_cache_pos[block_index]["pinned_global_start"].fill_(-1)
                 if use_cfg:
                     self.kv_cache_neg[block_index]["global_end_index"] = torch.tensor(
                         [0], dtype=torch.long, device=noise.device)
@@ -272,6 +274,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         [0], dtype=torch.long, device=noise.device)
                     self.kv_cache_neg[block_index]["pinned_start"].fill_(-1)
                     self.kv_cache_neg[block_index]["pinned_len"].zero_()
+                    self.kv_cache_neg[block_index]["pinned_global_start"].fill_(-1)
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -843,6 +846,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
                 kv_cache_neg.append({
                     "k": [clone_quantized_tensor(zero_qt) for _ in range(max_blocks)],
@@ -856,6 +860,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
             else:
                 kv_cache_pos.append({
@@ -870,6 +875,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
                 kv_cache_neg.append({
                     "k": torch.zeros([batch_size, kv_cache_size, num_heads, head_dim], dtype=dtype, device=device),
@@ -883,6 +889,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
 
         self.kv_cache_pos = kv_cache_pos  # always store the clean cache
@@ -928,6 +935,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                 "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
             })
         return kv_cache
 
@@ -1119,6 +1127,34 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             return None
         refer_latent = self._make_refer_latent_for_slots(refer_latent, num_slots)
 
+        if self.refer_sink_target == "global":
+            dst_start = self.refer_sink_start_slot * self.frame_seq_length
+            dst_global_start = dst_start
+        else:
+            pin_start = int(self.kv_cache_pos[0]["pinned_start"].item())
+            if pin_start < 0:
+                print(f"[refer-sink][skip] shot sink is not pinned yet at chunk={chunk_index}")
+                return None
+            pin_global_start = int(self.kv_cache_pos[0].get(
+                "pinned_global_start",
+                torch.tensor([-1], dtype=torch.long, device=device),
+            ).item())
+            if pin_global_start < 0:
+                print(f"[refer-sink][skip] shot sink has no global RoPE anchor at chunk={chunk_index}")
+                return None
+            dst_start = pin_start + self.refer_sink_start_slot * self.frame_seq_length
+            dst_global_start = pin_global_start + self.refer_sink_start_slot * self.frame_seq_length
+
+        if self.refer_sink_rope_mode == "aligned":
+            refer_start_frame = dst_global_start // self.frame_seq_length
+        elif self.refer_sink_rope_mode == "compact":
+            refer_start_frame = self.refer_sink_rope_start_frame
+        else:
+            raise ValueError(
+                "refer_sink_rope_mode must be 'aligned' or 'compact', "
+                f"got {self.refer_sink_rope_mode!r}"
+            )
+
         temp_pos = self._clone_empty_kv_cache(dtype=dtype, device=device)
         temp_neg = self._clone_empty_kv_cache(dtype=dtype, device=device) if use_cfg else None
         temp_cross_pos = [
@@ -1139,14 +1175,14 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         prev_rope_temporal_offset = getattr(dit, "rope_temporal_offset", 0.0)
         timestep = torch.zeros([batch_size, num_slots], device=device, dtype=torch.float32)
         try:
-            dit.rope_temporal_offset = float(self.refer_sink_rope_start_frame)
+            dit.rope_temporal_offset = 0.0
             self.generator(
                 noisy_image_or_video=refer_latent,
                 conditional_dict=conditional_dict,
                 timestep=timestep,
                 kv_cache=temp_pos,
                 crossattn_cache=temp_cross_pos,
-                current_start=self.refer_sink_rope_start_frame * self.frame_seq_length,
+                current_start=refer_start_frame * self.frame_seq_length,
                 cache_start=0,
             )
             if use_cfg:
@@ -1156,20 +1192,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     timestep=timestep,
                     kv_cache=temp_neg,
                     crossattn_cache=temp_cross_neg,
-                    current_start=self.refer_sink_rope_start_frame * self.frame_seq_length,
+                    current_start=refer_start_frame * self.frame_seq_length,
                     cache_start=0,
                 )
         finally:
             dit.rope_temporal_offset = prev_rope_temporal_offset
-
-        if self.refer_sink_target == "global":
-            dst_start = self.refer_sink_start_slot * self.frame_seq_length
-        else:
-            pin_start = int(self.kv_cache_pos[0]["pinned_start"].item())
-            if pin_start < 0:
-                print(f"[refer-sink][skip] shot sink is not pinned yet at chunk={chunk_index}")
-                return None
-            dst_start = pin_start + self.refer_sink_start_slot * self.frame_seq_length
 
         copy_tokens = num_slots * self.frame_seq_length
         dst_slice = slice(dst_start, dst_start + copy_tokens)
@@ -1192,7 +1219,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             f"[refer-sink] shot={shot_index} chunk={chunk_index} target={self.refer_sink_target} "
             f"image={image_path} slots={self.refer_sink_start_slot}:"
             f"{self.refer_sink_start_slot + num_slots} tokens={dst_slice.start}:{dst_slice.stop} "
-            f"rope_start={self.refer_sink_rope_start_frame} restore={self.refer_sink_restore}"
+            f"rope_mode={self.refer_sink_rope_mode} rope_frame={refer_start_frame} "
+            f"restore={self.refer_sink_restore}"
         )
         return restore
 
@@ -1232,11 +1260,13 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         # iter-38: local_end_index is in lockstep across all blocks. Read once.
         local_end = int(kv_cache[0]["local_end_index"].item())
+        global_end = int(kv_cache[0]["global_end_index"].item())
         chunk_start = local_end - chunk_tokens
 
         for block_cache in kv_cache:
             block_cache["pinned_start"].fill_(chunk_start)
             block_cache["pinned_len"].fill_(pin_len)
+            block_cache["pinned_global_start"].fill_(global_end - chunk_tokens)
 
     def _zero_kv_data(self, kv_cache, current_start_tokens):
         """Reset KV cache for clean recache, preserving global sink."""
@@ -1246,3 +1276,4 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             block_cache["global_end_index"].fill_(current_start_tokens)
             block_cache["pinned_start"].fill_(-1)
             block_cache["pinned_len"].zero_()
+            block_cache["pinned_global_start"].fill_(-1)

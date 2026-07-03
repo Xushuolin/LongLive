@@ -35,6 +35,7 @@ inference:
   refer_sink_num_slots: 2
   refer_sink_mode: repeat_first # repeat_first | cycle
   refer_sink_rope_start_frame: 0
+  refer_sink_rope_mode: aligned # aligned | compact
   refer_sink_target: shot # shot | global
   refer_sink_restore: true
   streaming_vae: false
