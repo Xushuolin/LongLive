@@ -225,7 +225,7 @@ class MultiTextConcatDataset(Dataset):
                         if not isinstance(refer, dict):
                             continue
                         refer = dict(refer)
-                        image_path = refer.get("image_path", None)
+                        image_path = refer.get("image_path")
                         if image_path:
                             image_path = Path(image_path)
                             if not image_path.is_absolute():

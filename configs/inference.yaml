@@ -32,12 +32,14 @@ inference:
   refer_sink_after_chunks: 1
   refer_sink_injection_chunks: 1
   refer_sink_start_slot: 0
-  refer_sink_num_slots: 2
+  refer_sink_num_slots: 0 # 0 means all remaining sink slots
   refer_sink_mode: repeat_first # repeat_first | cycle
-  refer_sink_rope_start_frame: 0
   refer_sink_rope_mode: aligned # aligned | compact
+  refer_sink_rope_start_frame: 0
   refer_sink_target: shot # shot | global
-  refer_sink_restore: true
+  refer_sink_restore: false
+  refer_sink_op: replace # replace | add
+  refer_sink_add_scale: 1.0
   streaming_vae: false
   async_vae: false
   vae_type: wan # wan, mg_lightvae, mg_lightvae_v2

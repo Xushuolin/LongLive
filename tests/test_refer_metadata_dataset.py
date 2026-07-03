@@ -13,32 +13,23 @@ class ReferMetadataDatasetTest(unittest.TestCase):
             shot_dir = root / "caption" / "sample"
             shot_dir.mkdir(parents=True)
             (shot_dir / "shot_durations.txt").write_text("2,2", encoding="utf-8")
-            (shot_dir / "0.json").write_text(
-                json.dumps({"caption": "first shot"}),
-                encoding="utf-8",
-            )
+            (shot_dir / "0.json").write_text(json.dumps({"caption": "first"}), encoding="utf-8")
             (shot_dir / "1.json").write_text(
                 json.dumps({
-                    "caption": "second shot",
+                    "caption": "second",
                     "refers": [{"image_path": "refs/subject.png", "role": "identity"}],
                 }),
                 encoding="utf-8",
             )
 
-            dataset = MultiTextConcatDataset(str(root), num_blocks=4)
-            item = dataset[0]
-
+            item = MultiTextConcatDataset(str(root), num_blocks=4)[0]
             self.assertEqual(item["refers"][0], [])
             self.assertEqual(item["refers"][1], [])
             self.assertEqual(item["refers"][2][0]["role"], "identity")
-            self.assertEqual(
-                item["refers"][2][0]["image_path"],
-                str(shot_dir / "refs" / "subject.png"),
-            )
+            self.assertEqual(item["refers"][2][0]["image_path"], str(shot_dir / "refs" / "subject.png"))
             self.assertEqual(item["refers"][3][0]["image_path"], item["refers"][2][0]["image_path"])
 
             batch = eval_collate_fn([item])
-            self.assertIn("refers", batch)
             self.assertEqual(batch["refers"][0][2][0]["role"], "identity")
 
 

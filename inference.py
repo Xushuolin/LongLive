@@ -89,20 +89,16 @@ def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_proces
 
 
 def load_refer_image_tensor(image_path: str, size_hw, device, dtype):
-    """Load a refer image as a Wan VAE pixel tensor [1, C, T=1, H, W]."""
     height, width = size_hw
     image = Image.open(image_path).convert("RGB").resize((width, height), Image.BICUBIC)
     array = torch.from_numpy(np.array(image)).to(device=device, dtype=torch.float32) / 255.0
-    tensor = array.permute(2, 0, 1).contiguous()
-    tensor = tensor * 2.0 - 1.0
+    tensor = array.permute(2, 0, 1).contiguous() * 2.0 - 1.0
     return tensor.to(dtype=dtype).unsqueeze(0).unsqueeze(2)
 
 
 def encode_refer_latents_for_sample(refers_for_sample, pipeline, config, device, dtype):
-    """Resolve refer image paths to latent tensors while preserving chunk metadata."""
     if not refers_for_sample:
         return None
-
     model_name = config.model_kwargs.model_name
     frame_raw_height = list(config.image_or_video_shape)[3] * wan_default_config[model_name]["spatial_compression_ratio"]
     frame_raw_width = list(config.image_or_video_shape)[4] * wan_default_config[model_name]["spatial_compression_ratio"]
@@ -116,10 +112,7 @@ def encode_refer_latents_for_sample(refers_for_sample, pipeline, config, device,
             image_path = refer["image_path"]
             if image_path not in encoded_by_path:
                 pixel = load_refer_image_tensor(
-                    image_path,
-                    (frame_raw_height, frame_raw_width),
-                    device,
-                    dtype,
+                    image_path, (frame_raw_height, frame_raw_width), device, dtype
                 )
                 encoded_by_path[image_path] = pipeline.vae.encode_to_latent(pixel).to(device=device, dtype=dtype)
             encoded_ref = dict(refer)
@@ -642,15 +635,12 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         return_latents=save_latents_only,
     )
     if "refers" in batch and getattr(config, "refer_sink_swap", False):
-        refers_for_sample = batch["refers"][0]
         refer_latents = encode_refer_latents_for_sample(
-            refers_for_sample,
-            pipeline,
-            config,
-            device,
-            torch.bfloat16,
+            batch["refers"][0], pipeline, config, device, torch.bfloat16
         )
-        if refer_latents:
+        if refer_latents is not None:
+            chunks_with_refs = sum(1 for chunk_refers in refer_latents if chunk_refers)
+            print(f"[refer-sink] loaded refer metadata: chunks_with_refs={chunks_with_refs}")
             inference_kwargs["refer_latents"] = refer_latents
     if initial_latent is not None:
         inference_kwargs["initial_latent"] = initial_latent
