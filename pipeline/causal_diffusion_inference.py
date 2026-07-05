@@ -1181,6 +1181,17 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         temp_pos = self._clone_empty_kv_cache(dtype=dtype, device=device)
         temp_neg = self._clone_empty_kv_cache(dtype=dtype, device=device) if use_cfg else None
+        refer_start_tokens = refer_start_frame * self.frame_seq_length
+        # The temporary cache is local and starts empty, but the refer forward
+        # uses the target sink's global RoPE/current_start. Seed
+        # global_end_index to the same global start so CausalWanModel writes the
+        # refer K/V into temp slots [0:copy_tokens] instead of trying to insert
+        # at local index == current_start.
+        for cache in temp_pos:
+            cache["global_end_index"].fill_(refer_start_tokens)
+        if temp_neg is not None:
+            for cache in temp_neg:
+                cache["global_end_index"].fill_(refer_start_tokens)
         temp_cross_pos = [
             {key: (value.clone() if torch.is_tensor(value) else value) for key, value in cache.items()}
             for cache in self.crossattn_cache_pos
@@ -1202,7 +1213,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             timestep=timestep,
             kv_cache=temp_pos,
             crossattn_cache=temp_cross_pos,
-            current_start=refer_start_frame * self.frame_seq_length,
+            current_start=refer_start_tokens,
             cache_start=0,
         )
         if use_cfg:
@@ -1212,7 +1223,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 timestep=timestep,
                 kv_cache=temp_neg,
                 crossattn_cache=temp_cross_neg,
-                current_start=refer_start_frame * self.frame_seq_length,
+                current_start=refer_start_tokens,
                 cache_start=0,
             )
 
@@ -1245,7 +1256,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             f"image={refer.get('image_path', '<latent>')} slots={self.refer_sink_start_slot}:"
             f"{self.refer_sink_start_slot + num_slots} tokens={dst_slice.start}:{dst_slice.stop} "
             f"rope_mode={self.refer_sink_rope_mode} rope_frame={refer_start_frame} "
-            f"op={self.refer_sink_op} restore={self.refer_sink_restore}"
+            f"temp_global_start={refer_start_tokens} op={self.refer_sink_op} "
+            f"restore={self.refer_sink_restore}"
         )
         return restore
 
