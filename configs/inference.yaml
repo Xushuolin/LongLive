@@ -40,6 +40,13 @@ inference:
   refer_sink_restore: false
   refer_sink_op: replace # replace | add
   refer_sink_add_scale: 1.0
+  refer_sink_lerp_alpha: 0.5
+  # Optional A3 warmup: on the scene-cut chunk, softly mix refer KV into the
+  # old/global sink before the new shot-sink exists, then restore it.
+  refer_presink_swap: false
+  refer_presink_target: global # global | shot
+  refer_presink_alpha: 0.5
+  refer_presink_restore: true
   streaming_vae: false
   async_vae: false
   vae_type: wan # wan, mg_lightvae, mg_lightvae_v2

@@ -79,6 +79,11 @@ refer_sink_target: shot           # shot | global
 refer_sink_restore: false         # keep the tampered sink for this first experiment
 refer_sink_op: replace            # replace | add
 refer_sink_add_scale: 1.0
+refer_sink_lerp_alpha: 0.5
+refer_presink_swap: false         # scene-cut chunk warmup before shot sink exists
+refer_presink_target: global      # global | shot
+refer_presink_alpha: 0.5
+refer_presink_restore: true
 ```
 
 For the first experiment, use:
@@ -147,6 +152,10 @@ the ShotStream refer-path behavior.
    - For the first debugging experiment, overwrite all shot-sink slots and do
      not restore the original sink. Use `refer_sink_op: add` as a follow-up
      ablation when hard replacement is too destructive.
+   - Optional A3 warmup: on the scene-cut chunk itself, softly mix refer K/V
+     into the old/global sink with `refer_presink_alpha`, restore that old sink
+     after the chunk, then let the normal post-sink replacement take over on
+     the next chunk.
 
 4. **RoPE / text routing**
    - Re-apply compact RoPE to swapped refer sink slots using

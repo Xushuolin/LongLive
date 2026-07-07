@@ -122,6 +122,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.refer_sink_restore = section_get(args, "inference", "refer_sink_restore", False)
         self.refer_sink_op = section_get(args, "inference", "refer_sink_op", "replace")
         self.refer_sink_add_scale = float(section_get(args, "inference", "refer_sink_add_scale", 1.0))
+        self.refer_sink_lerp_alpha = float(section_get(args, "inference", "refer_sink_lerp_alpha", 0.5))
+        self.refer_presink_swap = section_get(args, "inference", "refer_presink_swap", False)
+        self.refer_presink_target = section_get(args, "inference", "refer_presink_target", "global")
+        self.refer_presink_alpha = float(section_get(args, "inference", "refer_presink_alpha", 0.5))
+        self.refer_presink_restore = section_get(args, "inference", "refer_presink_restore", True)
         self.guidance_scale = section_get(args, "inference", "guidance_scale", getattr(args, "guidance_scale", 1.0))
         self.negative_prompt = section_get(args, "inference", "negative_prompt", getattr(args, "negative_prompt", ""))
         self.streaming_vae = section_get(args, "inference", "streaming_vae", getattr(args, "streaming_vae", False))
@@ -521,7 +526,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             print(
                 f"[refer-sink] enabled target={self.refer_sink_target} "
                 f"chunks_with_refs={chunks_with_refs} after_chunks={self.refer_sink_after_chunks} "
-                f"injection_chunks={self.refer_sink_injection_chunks}"
+                f"injection_chunks={self.refer_sink_injection_chunks} "
+                f"presink={self.refer_presink_swap} presink_target={self.refer_presink_target} "
+                f"presink_alpha={self.refer_presink_alpha}"
             )
         global _LLV2_PROFILE_CALL_COUNTER
         _call_idx = _LLV2_PROFILE_CALL_COUNTER
@@ -577,7 +584,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                       f"temporal_offset={self._dit_model.rope_temporal_offset:.4f}")
 
             refer_restore = None
-            if self._should_apply_refer_sink(chunk_index, raw_prompts, refer_latents):
+            if self._should_apply_presink_refer(chunk_index, raw_prompts, refer_latents):
                 refer_restore = self._apply_refer_sink_swap(
                     chunk_refers=refer_latents[chunk_index],
                     conditional_dict=conditional_dict,
@@ -588,7 +595,29 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     device=noise.device,
                     chunk_index=chunk_index,
                     shot_start_chunk=self._shot_start_for_chunk(raw_prompts, chunk_index),
+                    target_override=self.refer_presink_target,
+                    op_override="lerp",
+                    alpha_override=self.refer_presink_alpha,
+                    restore_override=self.refer_presink_restore,
+                    log_prefix="[refer-presink]",
                 )
+            if self._should_apply_refer_sink(chunk_index, raw_prompts, refer_latents):
+                post_restore = self._apply_refer_sink_swap(
+                    chunk_refers=refer_latents[chunk_index],
+                    conditional_dict=conditional_dict,
+                    unconditional_dict=unconditional_dict,
+                    use_cfg=use_cfg,
+                    batch_size=batch_size,
+                    dtype=noise.dtype,
+                    device=noise.device,
+                    chunk_index=chunk_index,
+                    shot_start_chunk=self._shot_start_for_chunk(raw_prompts, chunk_index),
+                )
+                if post_restore:
+                    if refer_restore:
+                        refer_restore.extend(post_restore)
+                    else:
+                        refer_restore = post_restore
 
             first_i2v_block = clamp_i2v_first_chunk and chunk_index == 0
             noise_start_frame = (
@@ -734,7 +763,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     del decoded_chunk, chunk_bcthw
                     torch.cuda.empty_cache()
 
-            if refer_restore is not None and self.refer_sink_restore:
+            if refer_restore is not None:
                 self._restore_refer_sink_slots(refer_restore)
 
             # Step 3.4: update the start and end frame indices
@@ -1095,6 +1124,19 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             return False
         return True
 
+    def _should_apply_presink_refer(self, chunk_index, raw_prompts, refer_latents):
+        if not self.refer_presink_swap or refer_latents is None or chunk_index >= len(refer_latents):
+            return False
+        if not self._is_shot_boundary(raw_prompts, chunk_index):
+            return False
+        chunk_refers = refer_latents[chunk_index]
+        if not chunk_refers:
+            return False
+        if not self.multi_shot_sink or not self.sink_size:
+            print(f"[refer-presink][skip] chunk={chunk_index} has refs but multi_shot_sink/sink_size is disabled")
+            return False
+        return True
+
     def _clone_empty_kv_cache(self, dtype, device):
         if self.quantize_kv:
             raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
@@ -1143,11 +1185,20 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         device,
         chunk_index,
         shot_start_chunk,
+        target_override=None,
+        op_override=None,
+        alpha_override=None,
+        restore_override=None,
+        log_prefix="[refer-sink]",
     ):
         if self.quantize_kv:
             raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
-        if self.refer_sink_target not in {"shot", "global"}:
-            raise ValueError(f"refer_sink_target must be 'shot' or 'global', got {self.refer_sink_target!r}")
+        target = self.refer_sink_target if target_override is None else target_override
+        op = self.refer_sink_op if op_override is None else op_override
+        alpha = self.refer_sink_lerp_alpha if alpha_override is None else alpha_override
+        restore_slots = self.refer_sink_restore if restore_override is None else restore_override
+        if target not in {"shot", "global"}:
+            raise ValueError(f"refer sink target must be 'shot' or 'global', got {target!r}")
 
         max_slots = max(0, self.sink_size - self.refer_sink_start_slot)
         requested_slots = self.refer_sink_num_slots
@@ -1155,7 +1206,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if num_slots <= 0:
             return None
 
-        if self.refer_sink_target == "global":
+        if target == "global":
             dst_start = self.refer_sink_start_slot * self.frame_seq_length
             aligned_frame = self.refer_sink_start_slot
         else:
@@ -1234,30 +1285,37 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         for active_cache, temp_cache in ((self.kv_cache_pos, temp_pos), (self.kv_cache_neg, temp_neg)):
             if active_cache is None or temp_cache is None:
                 continue
-            snapshot = self._snapshot_kv_slots(active_cache, dst_slice) if self.refer_sink_restore else None
+            snapshot = self._snapshot_kv_slots(active_cache, dst_slice) if restore_slots else None
             for active_block, temp_block in zip(active_cache, temp_cache):
-                if self.refer_sink_op == "replace":
+                if op == "replace":
                     active_block["k"][:, dst_slice] = temp_block["k"][:, src_slice]
                     active_block["v"][:, dst_slice] = temp_block["v"][:, src_slice]
-                elif self.refer_sink_op == "add":
+                elif op == "add":
                     active_block["k"][:, dst_slice] = (
                         active_block["k"][:, dst_slice] + self.refer_sink_add_scale * temp_block["k"][:, src_slice]
                     )
                     active_block["v"][:, dst_slice] = (
                         active_block["v"][:, dst_slice] + self.refer_sink_add_scale * temp_block["v"][:, src_slice]
                     )
+                elif op == "lerp":
+                    active_block["k"][:, dst_slice] = (
+                        (1.0 - alpha) * active_block["k"][:, dst_slice] + alpha * temp_block["k"][:, src_slice]
+                    )
+                    active_block["v"][:, dst_slice] = (
+                        (1.0 - alpha) * active_block["v"][:, dst_slice] + alpha * temp_block["v"][:, src_slice]
+                    )
                 else:
-                    raise ValueError(f"Unsupported refer_sink_op={self.refer_sink_op!r}")
+                    raise ValueError(f"Unsupported refer sink op={op!r}")
             if snapshot is not None:
                 restore.append((active_cache, dst_slice, snapshot))
 
         print(
-            f"[refer-sink] APPLY chunk={chunk_index} target={self.refer_sink_target} "
+            f"{log_prefix} APPLY chunk={chunk_index} target={target} "
             f"image={refer.get('image_path', '<latent>')} slots={self.refer_sink_start_slot}:"
             f"{self.refer_sink_start_slot + num_slots} tokens={dst_slice.start}:{dst_slice.stop} "
             f"rope_mode={self.refer_sink_rope_mode} rope_frame={refer_start_frame} "
-            f"temp_global_start={refer_start_tokens} op={self.refer_sink_op} "
-            f"restore={self.refer_sink_restore}"
+            f"temp_global_start={refer_start_tokens} op={op} alpha={alpha} "
+            f"restore={restore_slots}"
         )
         return restore
 
