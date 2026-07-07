@@ -69,21 +69,33 @@ Add these under LongLive2's inference config:
 ```yaml
 refer_sink_swap: false
 refer_sink_after_chunks: 1        # wait until this many chunks of the shot exist
-refer_sink_start_slot: 1          # keep slot 0 as generated anchor by default
-refer_sink_num_slots: 2           # with sink_size=3, swap slots 1 and 2
+refer_sink_injection_chunks: 1    # keep the subject KV swapped for this many chunks
+refer_sink_start_slot: 0          # SPAWN-aligned default; ablate against slot 1
+refer_sink_num_slots: 0           # 0 means swap all remaining sink slots
 refer_sink_mode: cycle            # cycle | repeat_first
+refer_sink_rope_mode: aligned     # aligned | compact
 refer_sink_rope_start_frame: 0    # compact RoPE id for swapped refer slots
+refer_sink_target: shot           # shot | global
+refer_sink_restore: false         # keep the tampered sink for this first experiment
+refer_sink_op: replace            # replace | add
+refer_sink_add_scale: 1.0
+refer_sink_lerp_alpha: 0.5
+refer_presink_swap: false         # scene-cut chunk warmup before shot sink exists
+refer_presink_target: global      # global | shot
+refer_presink_alpha: 0.5
+refer_presink_restore: true
 ```
 
 For the first experiment, use:
 
 ```yaml
 multi_shot_sink: true
-sink_size: 3
+sink_size: 8
 refer_sink_swap: true
 refer_sink_after_chunks: 1
-refer_sink_start_slot: 1
-refer_sink_num_slots: 2
+refer_sink_injection_chunks: 1
+refer_sink_start_slot: 0
+refer_sink_num_slots: 0
 ```
 
 This mirrors the safer ShotStream setting: preserve the first generated sink
@@ -131,6 +143,17 @@ the ShotStream refer-path behavior.
    - Copy only `refer_sink_start_slot : refer_sink_start_slot + refer_sink_num_slots`
      into the active shot/global sink cache.
    - Do not advance global/local cache pointers while copying swapped slots.
+   - Treat the swapped content as the subject image's KV cache, not raw pixels:
+     the reference image is first encoded as a latent, then recached at timestep
+     0 with RoPE aligned to the target sink slots, and only its generated K/V
+     tensors are copied into the sink.
+   - For the first debugging experiment, overwrite all shot-sink slots and do
+     not restore the original sink. Use `refer_sink_op: add` as a follow-up
+     ablation when hard replacement is too destructive.
+   - Optional A3 warmup: on the scene-cut chunk itself, softly mix refer K/V
+     into the old/global sink with `refer_presink_alpha`, restore that old sink
+     after the chunk, then let the normal post-sink replacement take over on
+     the next chunk.
 
 4. **RoPE / text routing**
    - Re-apply compact RoPE to swapped refer sink slots using
