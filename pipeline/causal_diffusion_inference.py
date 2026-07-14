@@ -126,6 +126,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.refer_presink_swap = section_get(args, "inference", "refer_presink_swap", False)
         self.refer_presink_target = section_get(args, "inference", "refer_presink_target", "global")
         self.refer_presink_alpha = float(section_get(args, "inference", "refer_presink_alpha", 0.5))
+        self.refer_presink_op = section_get(args, "inference", "refer_presink_op", "lerp")
+        self.refer_presink_add_scale = float(section_get(args, "inference", "refer_presink_add_scale", 1.0))
         self.refer_presink_restore = section_get(args, "inference", "refer_presink_restore", True)
         self.guidance_scale = section_get(args, "inference", "guidance_scale", getattr(args, "guidance_scale", 1.0))
         self.negative_prompt = section_get(args, "inference", "negative_prompt", getattr(args, "negative_prompt", ""))
@@ -528,7 +530,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 f"chunks_with_refs={chunks_with_refs} after_chunks={self.refer_sink_after_chunks} "
                 f"injection_chunks={self.refer_sink_injection_chunks} "
                 f"presink={self.refer_presink_swap} presink_target={self.refer_presink_target} "
-                f"presink_alpha={self.refer_presink_alpha}"
+                f"presink_op={self.refer_presink_op} presink_alpha={self.refer_presink_alpha}"
             )
         global _LLV2_PROFILE_CALL_COUNTER
         _call_idx = _LLV2_PROFILE_CALL_COUNTER
@@ -585,22 +587,33 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
             refer_restore = None
             if self._should_apply_presink_refer(chunk_index, raw_prompts, refer_latents):
-                refer_restore = self._apply_refer_sink_swap(
-                    chunk_refers=refer_latents[chunk_index],
-                    conditional_dict=conditional_dict,
-                    unconditional_dict=unconditional_dict,
-                    use_cfg=use_cfg,
-                    batch_size=batch_size,
-                    dtype=noise.dtype,
-                    device=noise.device,
-                    chunk_index=chunk_index,
-                    shot_start_chunk=self._shot_start_for_chunk(raw_prompts, chunk_index),
-                    target_override=self.refer_presink_target,
-                    op_override="lerp",
-                    alpha_override=self.refer_presink_alpha,
-                    restore_override=self.refer_presink_restore,
-                    log_prefix="[refer-presink]",
-                )
+                if self.refer_presink_target == "both":
+                    presink_targets = ("global", "shot")
+                else:
+                    presink_targets = (self.refer_presink_target,)
+                for presink_target in presink_targets:
+                    presink_restore = self._apply_refer_sink_swap(
+                        chunk_refers=refer_latents[chunk_index],
+                        conditional_dict=conditional_dict,
+                        unconditional_dict=unconditional_dict,
+                        use_cfg=use_cfg,
+                        batch_size=batch_size,
+                        dtype=noise.dtype,
+                        device=noise.device,
+                        chunk_index=chunk_index,
+                        shot_start_chunk=self._shot_start_for_chunk(raw_prompts, chunk_index),
+                        target_override=presink_target,
+                        op_override=self.refer_presink_op,
+                        alpha_override=self.refer_presink_alpha,
+                        add_scale_override=self.refer_presink_add_scale,
+                        restore_override=self.refer_presink_restore,
+                        log_prefix="[refer-presink]",
+                    )
+                    if presink_restore:
+                        if refer_restore:
+                            refer_restore.extend(presink_restore)
+                        else:
+                            refer_restore = presink_restore
             if self._should_apply_refer_sink(chunk_index, raw_prompts, refer_latents):
                 post_restore = self._apply_refer_sink_swap(
                     chunk_refers=refer_latents[chunk_index],
@@ -1188,6 +1201,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         target_override=None,
         op_override=None,
         alpha_override=None,
+        add_scale_override=None,
         restore_override=None,
         log_prefix="[refer-sink]",
     ):
@@ -1196,6 +1210,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         target = self.refer_sink_target if target_override is None else target_override
         op = self.refer_sink_op if op_override is None else op_override
         alpha = self.refer_sink_lerp_alpha if alpha_override is None else alpha_override
+        add_scale = self.refer_sink_add_scale if add_scale_override is None else add_scale_override
         restore_slots = self.refer_sink_restore if restore_override is None else restore_override
         if target not in {"shot", "global"}:
             raise ValueError(f"refer sink target must be 'shot' or 'global', got {target!r}")
@@ -1292,10 +1307,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     active_block["v"][:, dst_slice] = temp_block["v"][:, src_slice]
                 elif op == "add":
                     active_block["k"][:, dst_slice] = (
-                        active_block["k"][:, dst_slice] + self.refer_sink_add_scale * temp_block["k"][:, src_slice]
+                        active_block["k"][:, dst_slice] + add_scale * temp_block["k"][:, src_slice]
                     )
                     active_block["v"][:, dst_slice] = (
-                        active_block["v"][:, dst_slice] + self.refer_sink_add_scale * temp_block["v"][:, src_slice]
+                        active_block["v"][:, dst_slice] + add_scale * temp_block["v"][:, src_slice]
                     )
                 elif op == "lerp":
                     active_block["k"][:, dst_slice] = (
@@ -1314,7 +1329,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             f"image={refer.get('image_path', '<latent>')} slots={self.refer_sink_start_slot}:"
             f"{self.refer_sink_start_slot + num_slots} tokens={dst_slice.start}:{dst_slice.stop} "
             f"rope_mode={self.refer_sink_rope_mode} rope_frame={refer_start_frame} "
-            f"temp_global_start={refer_start_tokens} op={op} alpha={alpha} "
+            f"temp_global_start={refer_start_tokens} op={op} alpha={alpha} add_scale={add_scale} "
             f"restore={restore_slots}"
         )
         return restore

@@ -44,8 +44,10 @@ inference:
   # Optional A3 warmup: on the scene-cut chunk, softly mix refer KV into the
   # old/global sink before the new shot-sink exists, then restore it.
   refer_presink_swap: false
-  refer_presink_target: global # global | shot
+  refer_presink_target: global # global | shot | both
+  refer_presink_op: lerp # replace | add | lerp
   refer_presink_alpha: 0.5
+  refer_presink_add_scale: 1.0
   refer_presink_restore: true
   streaming_vae: false
   async_vae: false

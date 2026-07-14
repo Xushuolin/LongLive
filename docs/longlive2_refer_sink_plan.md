@@ -77,12 +77,14 @@ refer_sink_rope_mode: aligned     # aligned | compact
 refer_sink_rope_start_frame: 0    # compact RoPE id for swapped refer slots
 refer_sink_target: shot           # shot | global
 refer_sink_restore: false         # keep the tampered sink for this first experiment
-refer_sink_op: replace            # replace | add
+refer_sink_op: replace            # replace | add | lerp
 refer_sink_add_scale: 1.0
 refer_sink_lerp_alpha: 0.5
 refer_presink_swap: false         # scene-cut chunk warmup before shot sink exists
-refer_presink_target: global      # global | shot
-refer_presink_alpha: 0.5
+refer_presink_target: global      # global | shot | both
+refer_presink_op: lerp            # replace | add | lerp
+refer_presink_alpha: 0.5          # used only by lerp
+refer_presink_add_scale: 1.0      # used only by add
 refer_presink_restore: true
 ```
 
@@ -98,10 +100,27 @@ refer_sink_start_slot: 0
 refer_sink_num_slots: 0
 ```
 
-This keeps LongLive2's default `sink_size=8` and starts with a two-slot
-SPAWN-style subject KV swap. Ablate against the safer ShotStream setting
-(`refer_sink_start_slot: 1`) to test whether preserving the first generated
-sink slot is more stable than replacing the first two anchor slots.
+This mirrors the safer ShotStream setting: wait for the first generated chunk
+to be pinned as the shot sink, then replace that shot sink from the next chunk.
+
+For the first-frame/first-chunk transition experiment, `refer_sink_target: shot`
+cannot affect the scene-cut chunk because the new shot sink is created only
+after that chunk finishes and `_pin_current_chunk` runs. Use the pre-sink path
+to temporarily tamper with the context available before the scene-cut chunk is
+generated:
+
+```yaml
+refer_sink_swap: true
+refer_presink_swap: true
+refer_presink_target: global      # try both for later cuts; global is always present
+refer_presink_op: replace         # strongest visibility test; alpha is ignored
+refer_presink_restore: true       # restore old/global sink after the chunk is generated
+refer_sink_after_chunks: 1
+refer_sink_injection_chunks: 1
+refer_sink_target: shot
+refer_sink_op: replace
+refer_sink_restore: false
+```
 
 ### Suggested prompt / metadata format
 
@@ -152,10 +171,12 @@ the ShotStream refer-path behavior.
    - For the first debugging experiment, overwrite all shot-sink slots and do
      not restore the original sink. Use `refer_sink_op: add` as a follow-up
      ablation when hard replacement is too destructive.
-   - Optional A3 warmup: on the scene-cut chunk itself, softly mix refer K/V
-     into the old/global sink with `refer_presink_alpha`, restore that old sink
-     after the chunk, then let the normal post-sink replacement take over on
-     the next chunk.
+   - Optional A3 warmup: on the scene-cut chunk itself, inject refer K/V into
+     the old/global context before the new shot sink exists. `refer_presink_op`
+     supports `replace` (hard overwrite), `add` (residual add using
+     `refer_presink_add_scale`), and `lerp` (weighted blend using
+     `refer_presink_alpha`). Restore that old/global sink after the chunk, then
+     let the normal post-sink replacement take over on the next chunk.
 
 4. **RoPE / text routing**
    - Re-apply compact RoPE to swapped refer sink slots using
