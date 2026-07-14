@@ -276,6 +276,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_pos[block_index]["pinned_start"].fill_(-1)
                 self.kv_cache_pos[block_index]["pinned_len"].zero_()
+                self.kv_cache_pos[block_index]["pinned_global_start"].fill_(-1)
                 if use_cfg:
                     self.kv_cache_neg[block_index]["global_end_index"] = torch.tensor(
                         [0], dtype=torch.long, device=noise.device)
@@ -283,6 +284,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         [0], dtype=torch.long, device=noise.device)
                     self.kv_cache_neg[block_index]["pinned_start"].fill_(-1)
                     self.kv_cache_neg[block_index]["pinned_len"].zero_()
+                    self.kv_cache_neg[block_index]["pinned_global_start"].fill_(-1)
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -894,6 +896,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
                 kv_cache_neg.append({
                     "k": [clone_quantized_tensor(zero_qt) for _ in range(max_blocks)],
@@ -907,6 +910,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
             else:
                 kv_cache_pos.append({
@@ -921,6 +925,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
                 kv_cache_neg.append({
                     "k": torch.zeros([batch_size, kv_cache_size, num_heads, head_dim], dtype=dtype, device=device),
@@ -934,6 +939,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
                     "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
                 })
 
         self.kv_cache_pos = kv_cache_pos  # always store the clean cache
@@ -961,6 +967,27 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         self.crossattn_cache_pos = crossattn_cache_pos  # always store the clean cache
         self.crossattn_cache_neg = crossattn_cache_neg  # always store the clean cache
+
+    def _clone_empty_kv_cache(self, dtype, device):
+        if self.quantize_kv:
+            raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
+        kv_cache = []
+        for block_cache in self.kv_cache_pos:
+            kv_cache.append({
+                "k": torch.zeros_like(block_cache["k"], dtype=dtype, device=device),
+                "v": torch.zeros_like(block_cache["v"], dtype=dtype, device=device),
+                "quantized": False,
+                "block_token_size": block_cache["block_token_size"],
+                "max_blocks": block_cache["max_blocks"],
+                "num_heads": block_cache["num_heads"],
+                "num_filled_blocks": 0,
+                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
+                "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                "pinned_global_start": torch.tensor([-1], dtype=torch.long, device=device),
+            })
+        return kv_cache
 
     def clear_cache(self):
         """
@@ -1381,11 +1408,13 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         # iter-38: local_end_index is in lockstep across all blocks. Read once.
         local_end = int(kv_cache[0]["local_end_index"].item())
+        global_end = int(kv_cache[0]["global_end_index"].item())
         chunk_start = local_end - chunk_tokens
 
         for block_cache in kv_cache:
             block_cache["pinned_start"].fill_(chunk_start)
             block_cache["pinned_len"].fill_(pin_len)
+            block_cache["pinned_global_start"].fill_(global_end - chunk_tokens)
 
     def _zero_kv_data(self, kv_cache, current_start_tokens):
         """Reset KV cache for clean recache, preserving global sink."""
@@ -1395,3 +1424,4 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             block_cache["global_end_index"].fill_(current_start_tokens)
             block_cache["pinned_start"].fill_(-1)
             block_cache["pinned_len"].zero_()
+            block_cache["pinned_global_start"].fill_(-1)
