@@ -34,6 +34,7 @@ inference:
   refer_sink_start_slot: 0
   refer_sink_num_slots: 0 # 0 means all remaining sink slots
   refer_sink_mode: repeat_first # repeat_first | cycle
+  refer_sink_multi_mode: interleave # interleave | block | repeat_first
   refer_sink_rope_mode: aligned # aligned | compact
   refer_sink_rope_start_frame: 0
   refer_sink_target: shot # shot | global

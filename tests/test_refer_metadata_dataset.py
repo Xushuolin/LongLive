@@ -17,7 +17,10 @@ class ReferMetadataDatasetTest(unittest.TestCase):
             (shot_dir / "1.json").write_text(
                 json.dumps({
                     "caption": "second",
-                    "refers": [{"image_path": "refs/subject.png", "role": "identity"}],
+                    "refers": [
+                        {"image_path": "refs/subject.png", "role": "identity"},
+                        {"image_path": "refs/prop.png", "role": "prop"},
+                    ],
                 }),
                 encoding="utf-8",
             )
@@ -25,12 +28,17 @@ class ReferMetadataDatasetTest(unittest.TestCase):
             item = MultiTextConcatDataset(str(root), num_blocks=4)[0]
             self.assertEqual(item["refers"][0], [])
             self.assertEqual(item["refers"][1], [])
+            self.assertEqual(len(item["refers"][2]), 2)
             self.assertEqual(item["refers"][2][0]["role"], "identity")
+            self.assertEqual(item["refers"][2][1]["role"], "prop")
             self.assertEqual(item["refers"][2][0]["image_path"], str(shot_dir / "refs" / "subject.png"))
+            self.assertEqual(item["refers"][2][1]["image_path"], str(shot_dir / "refs" / "prop.png"))
             self.assertEqual(item["refers"][3][0]["image_path"], item["refers"][2][0]["image_path"])
+            self.assertEqual(item["refers"][3][1]["image_path"], item["refers"][2][1]["image_path"])
 
             batch = eval_collate_fn([item])
             self.assertEqual(batch["refers"][0][2][0]["role"], "identity")
+            self.assertEqual(batch["refers"][0][2][1]["role"], "prop")
 
 
 if __name__ == "__main__":

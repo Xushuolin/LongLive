@@ -116,6 +116,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.refer_sink_start_slot = int(section_get(args, "inference", "refer_sink_start_slot", 0))
         self.refer_sink_num_slots = int(section_get(args, "inference", "refer_sink_num_slots", 0))
         self.refer_sink_mode = section_get(args, "inference", "refer_sink_mode", "repeat_first")
+        self.refer_sink_multi_mode = section_get(args, "inference", "refer_sink_multi_mode", "interleave")
         self.refer_sink_rope_mode = section_get(args, "inference", "refer_sink_rope_mode", "aligned")
         self.refer_sink_rope_start_frame = int(section_get(args, "inference", "refer_sink_rope_start_frame", 0))
         self.refer_sink_target = section_get(args, "inference", "refer_sink_target", "shot")
@@ -1167,7 +1168,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
         } for block_cache in self.kv_cache_pos]
 
-    def _make_refer_latent_for_slots(self, refer_latent, num_slots):
+    def _make_single_refer_latent_for_slots(self, refer_latent, num_slots):
         if refer_latent.shape[1] >= num_slots:
             return refer_latent[:, :num_slots]
         if self.refer_sink_mode == "cycle":
@@ -1176,6 +1177,47 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if self.refer_sink_mode != "repeat_first":
             raise ValueError(f"Unsupported refer_sink_mode={self.refer_sink_mode!r}")
         return refer_latent[:, :1].repeat(1, num_slots, 1, 1, 1)
+
+    def _make_multi_refer_latent_for_slots(self, chunk_refers, num_slots, batch_size, dtype, device):
+        valid_refers = [refer for refer in (chunk_refers or []) if isinstance(refer, dict) and refer.get("latent") is not None]
+        if not valid_refers:
+            return None, []
+        if len(valid_refers) == 1:
+            refer = valid_refers[0]
+            refer_latent = refer["latent"].to(device=device, dtype=dtype)
+            if refer_latent.shape[0] == 1 and batch_size > 1:
+                refer_latent = refer_latent.repeat(batch_size, 1, 1, 1, 1)
+            return self._make_single_refer_latent_for_slots(refer_latent, num_slots), [refer]
+
+        if self.refer_sink_multi_mode not in {"interleave", "block", "repeat_first"}:
+            raise ValueError(f"Unsupported refer_sink_multi_mode={self.refer_sink_multi_mode!r}")
+
+        slot_latents = []
+        used_refers = []
+        per_refer_slot_counts = [0 for _ in valid_refers]
+        for slot_idx in range(num_slots):
+            if self.refer_sink_multi_mode == "block":
+                refer_idx = min(slot_idx * len(valid_refers) // num_slots, len(valid_refers) - 1)
+            elif self.refer_sink_multi_mode == "repeat_first":
+                refer_idx = 0
+            else:
+                refer_idx = slot_idx % len(valid_refers)
+
+            refer = valid_refers[refer_idx]
+            refer_latent = refer["latent"].to(device=device, dtype=dtype)
+            if refer_latent.shape[0] == 1 and batch_size > 1:
+                refer_latent = refer_latent.repeat(batch_size, 1, 1, 1, 1)
+            if self.refer_sink_mode == "cycle":
+                frame_idx = per_refer_slot_counts[refer_idx] % refer_latent.shape[1]
+            elif self.refer_sink_mode == "repeat_first":
+                frame_idx = 0
+            else:
+                raise ValueError(f"Unsupported refer_sink_mode={self.refer_sink_mode!r}")
+            slot_latents.append(refer_latent[:, frame_idx:frame_idx + 1])
+            used_refers.append(refer)
+            per_refer_slot_counts[refer_idx] += 1
+
+        return torch.cat(slot_latents, dim=1), used_refers
 
     def _snapshot_kv_slots(self, kv_cache, dst_slice):
         return [(block_cache["k"][:, dst_slice].clone(), block_cache["v"][:, dst_slice].clone())
@@ -1239,11 +1281,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported refer_sink_rope_mode={self.refer_sink_rope_mode!r}")
 
-        refer = chunk_refers[0]
-        refer_latent = refer["latent"].to(device=device, dtype=dtype)
-        if refer_latent.shape[0] == 1 and batch_size > 1:
-            refer_latent = refer_latent.repeat(batch_size, 1, 1, 1, 1)
-        refer_latent = self._make_refer_latent_for_slots(refer_latent, num_slots)
+        refer_latent, used_refers = self._make_multi_refer_latent_for_slots(
+            chunk_refers, num_slots, batch_size, dtype, device
+        )
+        if refer_latent is None:
+            return None
 
         temp_pos = self._clone_empty_kv_cache(dtype=dtype, device=device)
         temp_neg = self._clone_empty_kv_cache(dtype=dtype, device=device) if use_cfg else None
@@ -1326,7 +1368,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         print(
             f"{log_prefix} APPLY chunk={chunk_index} target={target} "
-            f"image={refer.get('image_path', '<latent>')} slots={self.refer_sink_start_slot}:"
+            f"images={[refer.get('image_path', '<latent>') for refer in used_refers]} "
+            f"multi_mode={self.refer_sink_multi_mode} slots={self.refer_sink_start_slot}:"
             f"{self.refer_sink_start_slot + num_slots} tokens={dst_slice.start}:{dst_slice.stop} "
             f"rope_mode={self.refer_sink_rope_mode} rope_frame={refer_start_frame} "
             f"temp_global_start={refer_start_tokens} op={op} alpha={alpha} add_scale={add_scale} "

@@ -72,7 +72,8 @@ refer_sink_after_chunks: 1        # wait until this many chunks of the shot exis
 refer_sink_injection_chunks: 1    # keep the subject KV swapped for this many chunks
 refer_sink_start_slot: 0          # SPAWN-aligned default; ablate against slot 1
 refer_sink_num_slots: 0           # 0 means swap all remaining sink slots
-refer_sink_mode: cycle            # cycle | repeat_first
+refer_sink_mode: cycle            # cycle | repeat_first; frame selection inside each refer
+refer_sink_multi_mode: interleave # interleave | block | repeat_first; slot allocation across refers
 refer_sink_rope_mode: aligned     # aligned | compact
 refer_sink_rope_start_frame: 0    # compact RoPE id for swapped refer slots
 refer_sink_target: shot           # shot | global
@@ -163,6 +164,11 @@ the ShotStream refer-path behavior.
    - After `refer_sink_after_chunks`, encode refer frames into a temporary cache.
    - Copy only `refer_sink_start_slot : refer_sink_start_slot + refer_sink_num_slots`
      into the active shot/global sink cache.
+   - Multiple `refers` in the same chunk are now supported.
+     `refer_sink_multi_mode: interleave` alternates sink slots across refers
+     (A/B/A/B for two subjects), `block` assigns contiguous slot blocks
+     (A/A/A/A/B/B/B/B for two subjects with eight slots), and
+     `repeat_first` keeps the previous single-reference behavior.
    - Do not advance global/local cache pointers while copying swapped slots.
    - Treat the swapped content as the subject image's KV cache, not raw pixels:
      the reference image is first encoded as a latent, then recached at timestep
