@@ -195,8 +195,8 @@ the ShotStream refer-path behavior.
 1. LongLive2 baseline I2V, no refer sink swap.
 2. LongLive2 multi-shot sink only.
 3. Refer sink swap at shot start, all sink slots (expected to over-condition).
-4. Delayed refer sink swap after one generated chunk, slots `1:3` only.
-5. Delayed refer sink swap after two generated chunks, slots `1:3` only.
+4. Delayed refer sink swap after one generated chunk, slots `0:2`.
+5. Delayed refer sink swap after one generated chunk, slots `1:3` only.
 6. Refer in global sink only vs shot sink only.
 
 The safest default to start with is experiment 4.
