@@ -46,6 +46,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from pipeline import CausalDiffusionInferencePipeline
 from utils.dataset import MultiTextConcatDataset, MultiVideoConcatDataset, eval_collate_fn, multi_video_collate_fn
+from utils.refer_prompt import append_refer_binding_to_prompts, build_refer_kv_prompts
 from utils.misc import set_seed
 from utils.config import normalize_config, section_get, wan_default_config
 from utils.nvfp4_checkpoint import (
@@ -597,6 +598,36 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # MultiTextConcatDataset + eval_collate_fn: prompts[0] is List[str].
     block_prompts = list(batch['prompts'][0])
+    base_block_prompts = list(block_prompts)
+    refers_for_sample = batch.get("refers", [None])[0] if "refers" in batch else None
+    refer_binding_layout = section_get(
+        config, "inference", "refer_prompt_binding_use_layout",
+        getattr(config, "refer_prompt_binding_use_layout", True),
+    )
+    refer_kv_text_prompts = None
+    refer_prompt_binding = section_get(
+        config, "inference", "refer_prompt_binding", getattr(config, "refer_prompt_binding", False)
+    )
+    refer_prompt_binding_joint_scene = section_get(
+        config, "inference", "refer_prompt_binding_joint_scene",
+        getattr(config, "refer_prompt_binding_joint_scene", False),
+    )
+    refer_kv_prompt_binding = section_get(
+        config, "inference", "refer_kv_prompt_binding", getattr(config, "refer_kv_prompt_binding", False)
+    )
+    if refer_prompt_binding and refers_for_sample is not None:
+        block_prompts = append_refer_binding_to_prompts(
+            block_prompts,
+            refers_for_sample,
+            joint_scene=refer_prompt_binding_joint_scene,
+            use_layout=refer_binding_layout,
+        )
+    if refer_kv_prompt_binding and refers_for_sample is not None:
+        refer_kv_text_prompts = build_refer_kv_prompts(
+            base_block_prompts,
+            refers_for_sample,
+            use_layout=refer_binding_layout,
+        )
     prompt = block_prompts[0]  # for filename
     prompts = [block_prompts] * config.num_samples
 
@@ -642,6 +673,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             chunks_with_refs = sum(1 for chunk_refers in refer_latents if chunk_refers)
             print(f"[refer-sink] loaded refer metadata: chunks_with_refs={chunks_with_refs}")
             inference_kwargs["refer_latents"] = refer_latents
+        if refer_kv_text_prompts is not None:
+            inference_kwargs["refer_kv_text_prompts"] = refer_kv_text_prompts
     if initial_latent is not None:
         inference_kwargs["initial_latent"] = initial_latent
     with torch.inference_mode():

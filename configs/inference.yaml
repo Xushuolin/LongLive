@@ -39,9 +39,14 @@ inference:
   refer_sink_rope_start_frame: 0
   refer_sink_target: shot # shot | global
   refer_sink_restore: false
-  refer_sink_op: replace # replace | add
+  refer_sink_op: replace # replace | add | lerp
   refer_sink_add_scale: 1.0
   refer_sink_lerp_alpha: 0.5
+  # Optional prompt binding for multi-refer disambiguation.
+  refer_prompt_binding: false
+  refer_prompt_binding_joint_scene: false
+  refer_prompt_binding_use_layout: true
+  refer_kv_prompt_binding: false
   # Optional A3 warmup: on the scene-cut chunk, softly mix refer KV into the
   # old/global sink before the new shot-sink exists, then restore it.
   refer_presink_swap: false

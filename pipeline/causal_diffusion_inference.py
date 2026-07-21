@@ -190,6 +190,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
         refer_latents: Optional[list] = None,
+        refer_kv_text_prompts: Optional[List[str]] = None,
         return_latents: bool = False,
         start_frame_index: Optional[int] = 0
     ) -> torch.Tensor:
@@ -236,6 +237,13 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             {"prompt_embeds": conditional_dict["prompt_embeds"][i:i+1]}
             for i in range(conditional_dict["prompt_embeds"].shape[0])
         ]
+        refer_conditional_dict_list = None
+        if refer_kv_text_prompts is not None:
+            refer_conditional_dict = self.text_encoder(text_prompts=refer_kv_text_prompts)
+            refer_conditional_dict_list = [
+                {"prompt_embeds": refer_conditional_dict["prompt_embeds"][i:i+1]}
+                for i in range(refer_conditional_dict["prompt_embeds"].shape[0])
+            ]
         use_cfg = self.guidance_scale != 1.0
         if use_cfg:
             unconditional_dict = self.text_encoder(
@@ -365,6 +373,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 current_start_frame=current_start_frame,
                 cache_start_frame=cache_start_frame,
                 raw_prompts=raw_prompts,
+                refer_conditional_dict_list=refer_conditional_dict_list,
             )
         finally:
             dit.local_attn_size = prev_local_attn_size
@@ -397,6 +406,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         use_cfg, initial_latent, refer_latents, clamp_i2v_first_chunk, return_latents,
         current_start_frame, cache_start_frame,
         raw_prompts=None,
+        refer_conditional_dict_list=None,
     ):
 
         if initial_latent is not None and not clamp_i2v_first_chunk:
@@ -571,6 +581,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 _ev_e = torch.cuda.Event(enable_timing=True)
                 _ev_s.record()
             conditional_dict = conditional_dict_list[chunk_index]
+            refer_conditional_dict = (
+                refer_conditional_dict_list[chunk_index]
+                if refer_conditional_dict_list is not None and chunk_index < len(refer_conditional_dict_list)
+                else conditional_dict
+            )
             # Reset the cross-attention cache when each chunk uses a different
             # prompt; otherwise the model reuses the previous chunk's k/v and
             # ignores the current conditional_dict.
@@ -595,7 +610,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 for presink_target in presink_targets:
                     presink_restore = self._apply_refer_sink_swap(
                         chunk_refers=refer_latents[chunk_index],
-                        conditional_dict=conditional_dict,
+                        conditional_dict=refer_conditional_dict,
                         unconditional_dict=unconditional_dict,
                         use_cfg=use_cfg,
                         batch_size=batch_size,
@@ -618,7 +633,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             if self._should_apply_refer_sink(chunk_index, raw_prompts, refer_latents):
                 post_restore = self._apply_refer_sink_swap(
                     chunk_refers=refer_latents[chunk_index],
-                    conditional_dict=conditional_dict,
+                    conditional_dict=refer_conditional_dict,
                     unconditional_dict=unconditional_dict,
                     use_cfg=use_cfg,
                     batch_size=batch_size,

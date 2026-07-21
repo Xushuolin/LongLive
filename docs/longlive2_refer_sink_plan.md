@@ -81,6 +81,10 @@ refer_sink_restore: false         # keep the tampered sink for this first experi
 refer_sink_op: replace            # replace | add | lerp
 refer_sink_add_scale: 1.0
 refer_sink_lerp_alpha: 0.5
+refer_prompt_binding: false       # append role/layout binding text to main prompts
+refer_prompt_binding_joint_scene: false
+refer_prompt_binding_use_layout: true
+refer_kv_prompt_binding: false    # use a joint-scene prompt when materializing refer K/V
 refer_presink_swap: false         # scene-cut chunk warmup before shot sink exists
 refer_presink_target: global      # global | shot | both
 refer_presink_op: lerp            # replace | add | lerp
@@ -169,6 +173,11 @@ the ShotStream refer-path behavior.
      (A/B/A/B for two subjects), `block` assigns contiguous slot blocks
      (A/A/A/A/B/B/B/B for two subjects with eight slots), and
      `repeat_first` keeps the previous single-reference behavior.
+   - Optional D1 binding: `refer_prompt_binding` appends role/layout clauses to
+     the main chunk prompt so text tokens explicitly bind each reference to an
+     object. `refer_kv_prompt_binding` keeps the main prompt path separate but
+     materializes refer K/V with a stronger joint-scene prompt, making the
+     temporary sink closer to a single coherent multi-object anchor.
    - Do not advance global/local cache pointers while copying swapped slots.
    - Treat the swapped content as the subject image's KV cache, not raw pixels:
      the reference image is first encoded as a latent, then recached at timestep
