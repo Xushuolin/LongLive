@@ -34,9 +34,11 @@ if not hasattr(_tv_io, "read_video"):
 
 import argparse
 import torch
+import numpy as np
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision.io import write_video
+from PIL import Image
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
@@ -44,6 +46,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from pipeline import CausalDiffusionInferencePipeline
 from utils.dataset import MultiTextConcatDataset, MultiVideoConcatDataset, eval_collate_fn, multi_video_collate_fn
+from utils.refer_prompt import append_refer_binding_to_prompts, build_refer_kv_prompts
 from utils.misc import set_seed
 from utils.config import normalize_config, section_get, wan_default_config
 from utils.nvfp4_checkpoint import (
@@ -84,6 +87,40 @@ def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_proces
     except Exception as e:
         if is_main_process:
             print(f"Warning: failed to save prompts to {prompt_txt_path}: {e}")
+
+
+def load_refer_image_tensor(image_path: str, size_hw, device, dtype):
+    height, width = size_hw
+    image = Image.open(image_path).convert("RGB").resize((width, height), Image.BICUBIC)
+    array = torch.from_numpy(np.array(image)).to(device=device, dtype=torch.float32) / 255.0
+    tensor = array.permute(2, 0, 1).contiguous() * 2.0 - 1.0
+    return tensor.to(dtype=dtype).unsqueeze(0).unsqueeze(2)
+
+
+def encode_refer_latents_for_sample(refers_for_sample, pipeline, config, device, dtype):
+    if not refers_for_sample:
+        return None
+    model_name = config.model_kwargs.model_name
+    frame_raw_height = list(config.image_or_video_shape)[3] * wan_default_config[model_name]["spatial_compression_ratio"]
+    frame_raw_width = list(config.image_or_video_shape)[4] * wan_default_config[model_name]["spatial_compression_ratio"]
+    encoded_by_path = {}
+    encoded_chunks = []
+    for chunk_refers in refers_for_sample:
+        encoded_refs = []
+        for refer in chunk_refers or []:
+            if not isinstance(refer, dict) or not refer.get("image_path"):
+                continue
+            image_path = refer["image_path"]
+            if image_path not in encoded_by_path:
+                pixel = load_refer_image_tensor(
+                    image_path, (frame_raw_height, frame_raw_width), device, dtype
+                )
+                encoded_by_path[image_path] = pipeline.vae.encode_to_latent(pixel).to(device=device, dtype=dtype)
+            encoded_ref = dict(refer)
+            encoded_ref["latent"] = encoded_by_path[image_path]
+            encoded_refs.append(encoded_ref)
+        encoded_chunks.append(encoded_refs)
+    return encoded_chunks
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -561,6 +598,36 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # MultiTextConcatDataset + eval_collate_fn: prompts[0] is List[str].
     block_prompts = list(batch['prompts'][0])
+    base_block_prompts = list(block_prompts)
+    refers_for_sample = batch.get("refers", [None])[0] if "refers" in batch else None
+    refer_binding_layout = section_get(
+        config, "inference", "refer_prompt_binding_use_layout",
+        getattr(config, "refer_prompt_binding_use_layout", True),
+    )
+    refer_kv_text_prompts = None
+    refer_prompt_binding = section_get(
+        config, "inference", "refer_prompt_binding", getattr(config, "refer_prompt_binding", False)
+    )
+    refer_prompt_binding_joint_scene = section_get(
+        config, "inference", "refer_prompt_binding_joint_scene",
+        getattr(config, "refer_prompt_binding_joint_scene", False),
+    )
+    refer_kv_prompt_binding = section_get(
+        config, "inference", "refer_kv_prompt_binding", getattr(config, "refer_kv_prompt_binding", False)
+    )
+    if refer_prompt_binding and refers_for_sample is not None:
+        block_prompts = append_refer_binding_to_prompts(
+            block_prompts,
+            refers_for_sample,
+            joint_scene=refer_prompt_binding_joint_scene,
+            use_layout=refer_binding_layout,
+        )
+    if refer_kv_prompt_binding and refers_for_sample is not None:
+        refer_kv_text_prompts = build_refer_kv_prompts(
+            base_block_prompts,
+            refers_for_sample,
+            use_layout=refer_binding_layout,
+        )
     prompt = block_prompts[0]  # for filename
     prompts = [block_prompts] * config.num_samples
 
@@ -598,6 +665,16 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         text_prompts=prompts,
         return_latents=save_latents_only,
     )
+    if "refers" in batch and getattr(config, "refer_sink_swap", False):
+        refer_latents = encode_refer_latents_for_sample(
+            batch["refers"][0], pipeline, config, device, torch.bfloat16
+        )
+        if refer_latents is not None:
+            chunks_with_refs = sum(1 for chunk_refers in refer_latents if chunk_refers)
+            print(f"[refer-sink] loaded refer metadata: chunks_with_refs={chunks_with_refs}")
+            inference_kwargs["refer_latents"] = refer_latents
+        if refer_kv_text_prompts is not None:
+            inference_kwargs["refer_kv_text_prompts"] = refer_kv_text_prompts
     if initial_latent is not None:
         inference_kwargs["initial_latent"] = initial_latent
     with torch.inference_mode():

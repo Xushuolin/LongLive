@@ -27,6 +27,34 @@ inference:
   guidance_scale: 1.0
   multi_shot_sink: true
   multi_shot_rope_offset: 8
+  # Experimental subject-reference sink swap. Disabled by default.
+  refer_sink_swap: false
+  refer_sink_after_chunks: 1
+  refer_sink_injection_chunks: 1
+  refer_sink_start_slot: 0
+  refer_sink_num_slots: 0 # 0 means all remaining sink slots
+  refer_sink_mode: repeat_first # repeat_first | cycle
+  refer_sink_multi_mode: interleave # interleave | block | repeat_first
+  refer_sink_rope_mode: aligned # aligned | compact
+  refer_sink_rope_start_frame: 0
+  refer_sink_target: shot # shot | global
+  refer_sink_restore: false
+  refer_sink_op: replace # replace | add | lerp
+  refer_sink_add_scale: 1.0
+  refer_sink_lerp_alpha: 0.5
+  # Optional prompt binding for multi-refer disambiguation.
+  refer_prompt_binding: false
+  refer_prompt_binding_joint_scene: false
+  refer_prompt_binding_use_layout: true
+  refer_kv_prompt_binding: false
+  # Optional A3 warmup: on the scene-cut chunk, softly mix refer KV into the
+  # old/global sink before the new shot-sink exists, then restore it.
+  refer_presink_swap: false
+  refer_presink_target: global # global | shot | both
+  refer_presink_op: lerp # replace | add | lerp
+  refer_presink_alpha: 0.5
+  refer_presink_add_scale: 1.0
+  refer_presink_restore: true
   streaming_vae: false
   async_vae: false
   vae_type: wan # wan, mg_lightvae, mg_lightvae_v2
