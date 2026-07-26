@@ -33,6 +33,15 @@ class ReferPromptBindingTest(unittest.TestCase):
         self.assertEqual(kv_prompts[0], "first shot")
         self.assertIn("Reference image 1 is the robot center", kv_prompts[1])
 
+    def test_binds_role_to_held_object_relation(self):
+        refers = [
+            {"role": "woman", "layout": "in the center"},
+            {"role": "red cup", "relation": "held by the woman in her right hand"},
+        ]
+        binding = build_refer_binding_text(refers, joint_scene=True)
+        self.assertIn("the woman in the center", binding)
+        self.assertIn("the red cup held by the woman in her right hand", binding)
+
 
 if __name__ == "__main__":
     unittest.main()

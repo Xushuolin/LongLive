@@ -34,6 +34,20 @@ class ReferLatentCompositionTest(unittest.TestCase):
         self.assertTrue(torch.all(joint[..., :2] == 1.0))
         self.assertTrue(torch.all(joint[..., 2:] == 2.0))
 
+    def test_prompt_layout_places_held_object_without_bbox(self):
+        history = torch.zeros((1, 1, 1, 10, 10))
+        refers = [{
+            "latent": torch.ones((1, 1, 1, 2, 2)),
+            "role": "red cup",
+            "relation": "held by the woman on the right",
+        }]
+        joint, _ = compose_joint_refer_latent(
+            refers, 1, 1, torch.float32, torch.device("cpu"),
+            history_latent=history, margin=0.0,
+        )
+        self.assertEqual(joint[0, 0, 0, 5, 6].item(), 1.0)
+        self.assertEqual(joint[0, 0, 0, 5, 2].item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

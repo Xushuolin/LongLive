@@ -4,6 +4,40 @@ import torch
 import torch.nn.functional as F
 
 
+def _layout_region(refer):
+    text = " ".join(
+        str(refer.get(key, ""))
+        for key in ("layout", "position", "relation", "action")
+    ).lower()
+    # Relations use a smaller torso/hand region. Text binding still carries the
+    # precise semantics; this region is only a soft spatial prior for recache.
+    if any(term in text for term in ("held by", "holding", "in hand", "拿着", "手持", "手里")):
+        if any(term in text for term in ("left", "左")):
+            return 0.18, 0.38, 0.48, 0.72
+        if any(term in text for term in ("right", "右")):
+            return 0.52, 0.38, 0.82, 0.72
+        return 0.40, 0.38, 0.70, 0.72
+    if any(term in text for term in ("upper left", "top left", "左上")):
+        return 0.02, 0.02, 0.50, 0.52
+    if any(term in text for term in ("upper right", "top right", "右上")):
+        return 0.50, 0.02, 0.98, 0.52
+    if any(term in text for term in ("lower left", "bottom left", "左下")):
+        return 0.02, 0.48, 0.50, 0.98
+    if any(term in text for term in ("lower right", "bottom right", "右下")):
+        return 0.50, 0.48, 0.98, 0.98
+    if any(term in text for term in ("left", "左侧", "左边")):
+        return 0.02, 0.05, 0.52, 0.95
+    if any(term in text for term in ("right", "右侧", "右边")):
+        return 0.48, 0.05, 0.98, 0.95
+    if any(term in text for term in ("center", "centre", "middle", "中央", "中间")):
+        return 0.20, 0.05, 0.80, 0.95
+    if any(term in text for term in ("foreground", "前景")):
+        return 0.15, 0.30, 0.85, 0.98
+    if any(term in text for term in ("background", "背景")):
+        return 0.05, 0.02, 0.95, 0.68
+    return None
+
+
 def _normalized_bbox(refer, index, count, margin=0.04):
     bbox = refer.get("bbox") if isinstance(refer, dict) else None
     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
@@ -11,11 +45,15 @@ def _normalized_bbox(refer, index, count, margin=0.04):
         if max(abs(x0), abs(y0), abs(x1), abs(y1)) > 1.0:
             raise ValueError("refer bbox must use normalized [0, 1] coordinates")
     else:
-        columns = math.ceil(math.sqrt(count))
-        rows = math.ceil(count / columns)
-        row, column = divmod(index, columns)
-        x0, x1 = column / columns, (column + 1) / columns
-        y0, y1 = row / rows, (row + 1) / rows
+        region = _layout_region(refer)
+        if region is not None:
+            x0, y0, x1, y1 = region
+        else:
+            columns = math.ceil(math.sqrt(count))
+            rows = math.ceil(count / columns)
+            row, column = divmod(index, columns)
+            x0, x1 = column / columns, (column + 1) / columns
+            y0, y1 = row / rows, (row + 1) / rows
 
     x0 = min(max(x0 + margin, 0.0), 1.0)
     y0 = min(max(y0 + margin, 0.0), 1.0)
@@ -51,7 +89,9 @@ def compose_joint_refer_latent(
         return None, []
 
     first = valid_refers[0]["latent"]
-    height, width = first.shape[-2:]
+    height, width = (
+        history_latent.shape[-2:] if history_latent is not None else first.shape[-2:]
+    )
     if history_latent is None:
         canvas = torch.zeros(
             (batch_size, num_frames, first.shape[2], height, width),

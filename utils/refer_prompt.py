@@ -10,8 +10,10 @@ def _format_refer_label(refer, index):
 
 def _format_layout_clause(refer):
     layout = refer.get("layout") or refer.get("position")
-    if layout:
-        return f" {layout}"
+    relation = refer.get("relation") or refer.get("action")
+    clauses = [str(value).strip() for value in (layout, relation) if value]
+    if clauses:
+        return " " + ", ".join(clauses)
     bbox = refer.get("bbox")
     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
         return f" in bbox {bbox}"

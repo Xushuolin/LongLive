@@ -186,9 +186,10 @@ the ShotStream refer-path behavior.
      materializes refer K/V with a stronger joint-scene prompt, making the
      temporary sink closer to a single coherent multi-object anchor.
    - Optional D2 pre-latent recache: `refer_joint_latent` spatially composes all
-     references before one shared DiT forward. A normalized
-     `bbox: [x0, y0, x1, y1]` controls each reference region; omitted boxes use
-     a deterministic grid. With `refer_joint_use_history`, unoccupied regions
+     references before one shared DiT forward. User-facing `layout`, `position`,
+     and `relation` text provides a coarse spatial prior; no numeric box is
+     required. Unspecified layouts use a deterministic grid. With
+     `refer_joint_use_history`, unoccupied regions
      retain the latest clean generated latent frame(s), so old scene identity
      and new objects interact before a single coherent K/V cache is created.
    - Do not advance global/local cache pointers while copying swapped slots.
@@ -261,11 +262,17 @@ refer_presink_op: replace
 refer_presink_restore: true
 ```
 
-Explicit spatial binding example:
+Recommended user-facing semantic binding example:
 
 ```json
 "refers": [
-  {"image_path": "refs/person.png", "role": "person", "bbox": [0.05, 0.05, 0.55, 0.95]},
-  {"image_path": "refs/object.png", "role": "object", "bbox": [0.60, 0.25, 0.95, 0.80]}
+  {"image_path": "refs/woman.png", "role": "the same woman", "layout": "in the center"},
+  {"image_path": "refs/cup.png", "role": "red cup", "relation": "held by the woman in her right hand"}
 ]
 ```
+
+The binding text is included in the dedicated refer-K/V prompt. The latent
+composer recognizes coarse phrases such as `left`, `right`, `center`,
+`foreground`, `background`, and `held by ... in the left/right hand`. These are
+soft recache priors rather than exact generation constraints. A normalized
+`bbox` remains available only as an expert/debug override.
