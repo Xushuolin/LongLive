@@ -169,6 +169,7 @@ class MultiTextConcatDataset(Dataset):
         caption = self._prompts[idx % len(self._prompts)]
         return {
             "prompts": [caption] * self.num_blocks,
+            "refers": [[] for _ in range(self.num_blocks)],
             "idx": idx,
         }
 
@@ -178,22 +179,27 @@ class MultiTextConcatDataset(Dataset):
 
     def _get_dir_item(self, idx):
         folder = self._folders[idx % len(self._folders)]
-        raw_captions = self._load_captions_from_folder(folder)
+        raw_captions, raw_refers = self._load_captions_from_folder(folder)
         if not raw_captions:
             raw_captions = [""]
+            raw_refers = [[]]
 
         shot_durations = self._resolve_shot_durations(folder, len(raw_captions))
         prompts = self._apply_shot_durations(raw_captions, shot_durations)
+        refers = self._apply_refer_durations(raw_refers, shot_durations)
 
         # Ensure exactly num_blocks prompts
         if len(prompts) > self.num_blocks:
             prompts = prompts[: self.num_blocks]
+            refers = refers[: self.num_blocks]
         elif len(prompts) < self.num_blocks:
             last = prompts[-1] if prompts else ""
             prompts.extend([last] * (self.num_blocks - len(prompts)))
+            refers.extend([[] for _ in range(self.num_blocks - len(refers))])
 
         return {
             "prompts": prompts,
+            "refers": refers,
             "idx": idx,
         }
 
@@ -203,14 +209,34 @@ class MultiTextConcatDataset(Dataset):
             key=lambda p: (p.stem.isdigit(), int(p.stem) if p.stem.isdigit() else 0, p.stem),
         )
         captions = []
+        refers = []
         for jf in json_files:
             try:
                 with open(jf, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     captions.append(data.get(self.caption_field, ""))
+                    shot_refers = data.get("refers", [])
+                    if shot_refers is None:
+                        shot_refers = []
+                    if isinstance(shot_refers, dict):
+                        shot_refers = [shot_refers]
+                    normalized_refers = []
+                    for refer in shot_refers:
+                        if not isinstance(refer, dict):
+                            continue
+                        refer = dict(refer)
+                        image_path = refer.get("image_path")
+                        if image_path:
+                            image_path = Path(image_path)
+                            if not image_path.is_absolute():
+                                image_path = jf.parent / image_path
+                            refer["image_path"] = str(image_path)
+                        normalized_refers.append(refer)
+                    refers.append(normalized_refers)
             except Exception:
                 captions.append("")
-        return captions
+                refers.append([])
+        return captions, refers
 
     # ------------------------------------------------------------------
     # shot duration helpers
@@ -264,6 +290,25 @@ class MultiTextConcatDataset(Dataset):
                 else:
                     prompts.append(caption)
         return prompts
+
+    def _apply_refer_durations(self, raw_refers, shot_durations):
+        target = self.num_blocks
+        clamped: list[int] = []
+        remaining = target
+        for d in shot_durations:
+            if remaining <= 0:
+                break
+            take = min(d, remaining)
+            clamped.append(take)
+            remaining -= take
+        if remaining > 0 and clamped:
+            clamped[-1] += remaining
+
+        refers: list[list[dict]] = []
+        for shot_refers, duration in zip(raw_refers, clamped):
+            for _ in range(duration):
+                refers.append([dict(refer) for refer in shot_refers])
+        return refers
 
 
 class MultiVideoConcatDataset(Dataset):
@@ -1068,6 +1113,8 @@ def eval_collate_fn(batch):
         "prompts": prompts_list,
         "idx": idx,
     }
+    if "refers" in batch[0]:
+        result["refers"] = [b["refers"] for b in batch]
     if "shot_durations" in batch[0]:
         result["shot_durations"] = [b["shot_durations"] for b in batch]
     return result
