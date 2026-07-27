@@ -20,6 +20,7 @@ from wan_5b.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from utils.wan_5b_wrapper import WanDiffusionWrapper, WanTextEncoder, build_vae_5b
 from utils.dataset import DEFAULT_SCENE_CUT_PREFIX
 from utils.config import section_get, wan_default_config
+from utils.refer_latent import compose_joint_refer_latent
 from utils.i2v_conditioning import (
     _overwrite_i2v_context,
     _zero_i2v_context_timestep,
@@ -124,6 +125,13 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.refer_sink_op = section_get(args, "inference", "refer_sink_op", "replace")
         self.refer_sink_add_scale = float(section_get(args, "inference", "refer_sink_add_scale", 1.0))
         self.refer_sink_lerp_alpha = float(section_get(args, "inference", "refer_sink_lerp_alpha", 0.5))
+        self.refer_joint_latent = section_get(args, "inference", "refer_joint_latent", False)
+        self.refer_joint_use_history = section_get(args, "inference", "refer_joint_use_history", True)
+        self.refer_joint_history_source = section_get(args, "inference", "refer_joint_history_source", "global")
+        self.refer_joint_history_frames = int(section_get(args, "inference", "refer_joint_history_frames", 1))
+        self.refer_joint_history_strength = float(section_get(args, "inference", "refer_joint_history_strength", 1.0))
+        self.refer_joint_alpha = float(section_get(args, "inference", "refer_joint_alpha", 1.0))
+        self.refer_joint_margin = float(section_get(args, "inference", "refer_joint_margin", 0.04))
         self.refer_presink_swap = section_get(args, "inference", "refer_presink_swap", False)
         self.refer_presink_target = section_get(args, "inference", "refer_presink_target", "global")
         self.refer_presink_alpha = float(section_get(args, "inference", "refer_presink_alpha", 0.5))
@@ -624,6 +632,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         add_scale_override=self.refer_presink_add_scale,
                         restore_override=self.refer_presink_restore,
                         log_prefix="[refer-presink]",
+                        history_latents=output[:, :cache_start_frame],
                     )
                     if presink_restore:
                         if refer_restore:
@@ -641,6 +650,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     device=noise.device,
                     chunk_index=chunk_index,
                     shot_start_chunk=self._shot_start_for_chunk(raw_prompts, chunk_index),
+                    history_latents=output[:, :cache_start_frame],
                 )
                 if post_restore:
                     if refer_restore:
@@ -1261,6 +1271,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         add_scale_override=None,
         restore_override=None,
         log_prefix="[refer-sink]",
+        history_latents=None,
     ):
         if self.quantize_kv:
             raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
@@ -1296,9 +1307,34 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported refer_sink_rope_mode={self.refer_sink_rope_mode!r}")
 
-        refer_latent, used_refers = self._make_multi_refer_latent_for_slots(
-            chunk_refers, num_slots, batch_size, dtype, device
-        )
+        if self.refer_joint_latent:
+            history = None
+            if self.refer_joint_use_history and history_latents is not None and history_latents.shape[1] > 0:
+                history_frames = max(1, self.refer_joint_history_frames)
+                if self.refer_joint_history_source == "global":
+                    history = history_latents[:, :history_frames]
+                elif self.refer_joint_history_source == "recent":
+                    history = history_latents[:, -history_frames:]
+                else:
+                    raise ValueError(
+                        "refer_joint_history_source must be 'global' or 'recent', got "
+                        f"{self.refer_joint_history_source!r}"
+                    )
+            refer_latent, used_refers = compose_joint_refer_latent(
+                chunk_refers,
+                num_frames=num_slots,
+                batch_size=batch_size,
+                dtype=dtype,
+                device=device,
+                history_latent=history,
+                history_strength=self.refer_joint_history_strength,
+                refer_alpha=self.refer_joint_alpha,
+                margin=self.refer_joint_margin,
+            )
+        else:
+            refer_latent, used_refers = self._make_multi_refer_latent_for_slots(
+                chunk_refers, num_slots, batch_size, dtype, device
+            )
         if refer_latent is None:
             return None
 
@@ -1388,7 +1424,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             f"{self.refer_sink_start_slot + num_slots} tokens={dst_slice.start}:{dst_slice.stop} "
             f"rope_mode={self.refer_sink_rope_mode} rope_frame={refer_start_frame} "
             f"temp_global_start={refer_start_tokens} op={op} alpha={alpha} add_scale={add_scale} "
-            f"restore={restore_slots}"
+            f"joint_latent={self.refer_joint_latent} joint_history="
+            f"{self.refer_joint_latent and self.refer_joint_use_history} "
+            f"history_source={self.refer_joint_history_source} restore={restore_slots}"
         )
         return restore
 

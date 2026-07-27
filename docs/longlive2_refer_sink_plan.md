@@ -85,6 +85,13 @@ refer_prompt_binding: false       # append role/layout binding text to main prom
 refer_prompt_binding_joint_scene: false
 refer_prompt_binding_use_layout: true
 refer_kv_prompt_binding: false    # use a joint-scene prompt when materializing refer K/V
+refer_joint_latent: false         # spatially compose refs before the temporary KV forward
+refer_joint_use_history: true     # retain generated history in empty canvas regions
+refer_joint_history_source: global # global | recent
+refer_joint_history_frames: 1
+refer_joint_history_strength: 1.0
+refer_joint_alpha: 1.0
+refer_joint_margin: 0.04
 refer_presink_swap: false         # scene-cut chunk warmup before shot sink exists
 refer_presink_target: global      # global | shot | both
 refer_presink_op: lerp            # replace | add | lerp
@@ -178,6 +185,13 @@ the ShotStream refer-path behavior.
      object. `refer_kv_prompt_binding` keeps the main prompt path separate but
      materializes refer K/V with a stronger joint-scene prompt, making the
      temporary sink closer to a single coherent multi-object anchor.
+   - Optional D2 pre-latent recache: `refer_joint_latent` spatially composes all
+     references before one shared DiT forward. User-facing `layout`, `position`,
+     and `relation` text provides a coarse spatial prior; no numeric box is
+     required. Unspecified layouts use a deterministic grid. With
+     `refer_joint_use_history`, unoccupied regions
+     retain the latest clean generated latent frame(s), so old scene identity
+     and new objects interact before a single coherent K/V cache is created.
    - Do not advance global/local cache pointers while copying swapped slots.
    - Treat the swapped content as the subject image's KV cache, not raw pixels:
      the reference image is first encoded as a latent, then recached at timestep
@@ -215,3 +229,50 @@ the ShotStream refer-path behavior.
 6. Refer in global sink only vs shot sink only.
 
 The safest default to start with is experiment 4.
+## D2: joint spatial pre-latent recache
+
+This experiment moves fusion earlier than K/V manipulation. Instead of
+materializing each reference independently and combining unrelated K/V, it
+builds one spatial latent canvas and runs that canvas through the DiT once.
+Spatial self-attention can therefore establish object-to-object relationships
+before the resulting K/V replaces the sink.
+
+When `refer_joint_use_history: true`, the canvas starts from clean generated
+latent frames. `refer_joint_history_source: global` uses the first generated
+frames that back the global sink, while `recent` uses the latest shot context.
+Reference patches are then placed into their boxes,
+leaving unoccupied regions as historical scene/identity memory. This is not a
+K/V average: history and references jointly participate in the same recache
+forward.
+
+Recommended first ablation:
+
+```yaml
+refer_joint_latent: true
+refer_joint_use_history: true
+refer_joint_history_source: global
+refer_joint_history_frames: 1
+refer_joint_history_strength: 1.0
+refer_joint_alpha: 1.0
+refer_joint_margin: 0.04
+refer_kv_prompt_binding: true
+refer_presink_swap: true
+refer_presink_target: global
+refer_presink_op: replace
+refer_presink_restore: true
+```
+
+Recommended user-facing semantic binding example:
+
+```json
+"refers": [
+  {"image_path": "refs/woman.png", "role": "the same woman", "layout": "in the center"},
+  {"image_path": "refs/cup.png", "role": "red cup", "relation": "held by the woman in her right hand"}
+]
+```
+
+The binding text is included in the dedicated refer-K/V prompt. The latent
+composer recognizes coarse phrases such as `left`, `right`, `center`,
+`foreground`, `background`, and `held by ... in the left/right hand`. These are
+soft recache priors rather than exact generation constraints. A normalized
+`bbox` remains available only as an expert/debug override.

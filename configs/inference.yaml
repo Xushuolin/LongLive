@@ -47,6 +47,15 @@ inference:
   refer_prompt_binding_joint_scene: false
   refer_prompt_binding_use_layout: true
   refer_kv_prompt_binding: false
+  # Materialize all references together in one spatial latent canvas. Empty
+  # canvas regions can retain historical generated latents before K/V recache.
+  refer_joint_latent: false
+  refer_joint_use_history: true
+  refer_joint_history_source: global # global | recent
+  refer_joint_history_frames: 1
+  refer_joint_history_strength: 1.0
+  refer_joint_alpha: 1.0
+  refer_joint_margin: 0.04
   # Optional A3 warmup: on the scene-cut chunk, softly mix refer KV into the
   # old/global sink before the new shot-sink exists, then restore it.
   refer_presink_swap: false
