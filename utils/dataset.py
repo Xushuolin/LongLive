@@ -451,18 +451,45 @@ class MultiVideoConcatDataset(Dataset):
 
     def _load_caption(self, video_path, folder_name):
         """Load caption for a video file."""
+        data = self._load_caption_data(video_path, folder_name)
+        return data.get(self.caption_field, "")
+
+    def _load_caption_data(self, video_path, folder_name):
+        """Load raw caption JSON for a video file."""
         video_stem = video_path.stem
         caption_folder = self._get_caption_folder(folder_name)
         caption_path = caption_folder / f"{video_stem}.json"
-        
+
         if caption_path.exists():
             try:
                 with open(caption_path, 'r', encoding='utf-8') as f:
-                    caption_data = json.load(f)
-                    return caption_data.get(self.caption_field, "")
+                    return json.load(f)
             except Exception:
-                return ""
-        return ""
+                return {}
+        return {}
+
+    def _load_refers(self, video_path, folder_name):
+        """Load optional refer metadata for a video caption JSON."""
+        caption_data = self._load_caption_data(video_path, folder_name)
+        shot_refers = caption_data.get("refers", [])
+        if shot_refers is None:
+            shot_refers = []
+        if isinstance(shot_refers, dict):
+            shot_refers = [shot_refers]
+        caption_folder = self._get_caption_folder(folder_name)
+        normalized_refers = []
+        for refer in shot_refers:
+            if not isinstance(refer, dict):
+                continue
+            refer = dict(refer)
+            image_path = refer.get("image_path", None)
+            if image_path:
+                image_path = Path(image_path)
+                if not image_path.is_absolute():
+                    image_path = caption_folder / image_path
+                refer["image_path"] = str(image_path)
+            normalized_refers.append(refer)
+        return normalized_refers
 
     def _get_video_files_in_folder(self, folder_path):
         """Get sorted video files in a folder, keeping only those with a per-video caption (cached)."""
@@ -810,6 +837,7 @@ class MultiVideoConcatDataset(Dataset):
         # Collect all segments
         all_segments = []
         prompts_list = []
+        refers_list = []
         
         try:
             # Start position
@@ -850,6 +878,7 @@ class MultiVideoConcatDataset(Dataset):
             
             prompt = self._load_caption(video_path, folder_name)
             prompts_list.append(prompt)
+            refers_list.append(self._load_refers(video_path, folder_name))
             
             # Update position for next sampling
             sampling_interval = original_fps / self.target_fps
@@ -928,6 +957,7 @@ class MultiVideoConcatDataset(Dataset):
                 if is_scene_cut and self.scene_cut_prefix:
                     prompt = self.scene_cut_prefix + prompt
                 prompts_list.append(prompt)
+                refers_list.append(self._load_refers(video_path, folder_name))
 
                 prev_seg_video_idx = current_video_idx
                 chunks_from_current_video += 1
@@ -970,6 +1000,7 @@ class MultiVideoConcatDataset(Dataset):
             if num_filled_segments < self.total_segments:
                 last_prompt = prompts_list[-1] if prompts_list else ""
                 prompts_list.extend([last_prompt] * (self.total_segments - num_filled_segments))
+                refers_list.extend([[] for _ in range(self.total_segments - len(refers_list))])
             
             # Concatenate all segments: (total_frames, 3, height, width)
             concatenated_video = torch.cat(all_segments, dim=0)
@@ -988,6 +1019,7 @@ class MultiVideoConcatDataset(Dataset):
             result = {
                 'frames': concatenated_video.permute(1, 0, 2, 3),
                 'prompts': prompts_list,
+                'refers': refers_list,
                 'idx': folder_idx
             }
             if self.return_image:
@@ -1096,6 +1128,9 @@ def multi_video_collate_fn(batch):
 
     if "image" in batch[0]:
         result["image"] = torch.stack([b["image"] for b in batch], dim=0)
+
+    if "refers" in batch[0]:
+        result["refers"] = [b["refers"] for b in batch]
 
     if "num_valid_latent_frames" in batch[0]:
         result["num_valid_latent_frames"] = torch.tensor(
