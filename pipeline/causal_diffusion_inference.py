@@ -21,6 +21,7 @@ from utils.wan_5b_wrapper import WanDiffusionWrapper, WanTextEncoder, build_vae_
 from utils.dataset import DEFAULT_SCENE_CUT_PREFIX
 from utils.config import section_get, wan_default_config
 from utils.refer_latent import compose_joint_refer_latent
+from utils.refer_schedule import progressive_refer_alpha
 from utils.i2v_conditioning import (
     _overwrite_i2v_context,
     _zero_i2v_context_timestep,
@@ -125,6 +126,17 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.refer_sink_op = section_get(args, "inference", "refer_sink_op", "replace")
         self.refer_sink_add_scale = float(section_get(args, "inference", "refer_sink_add_scale", 1.0))
         self.refer_sink_lerp_alpha = float(section_get(args, "inference", "refer_sink_lerp_alpha", 0.5))
+        self.refer_sink_schedule = section_get(args, "inference", "refer_sink_schedule", "constant")
+        self.refer_sink_schedule_start_alpha = float(
+            section_get(args, "inference", "refer_sink_schedule_start_alpha", 0.15)
+        )
+        self.refer_sink_schedule_end_alpha = float(
+            section_get(args, "inference", "refer_sink_schedule_end_alpha", 1.0)
+        )
+        if self.refer_sink_schedule not in {"constant", "linear", "cosine"}:
+            raise ValueError(f"Unsupported refer_sink_schedule={self.refer_sink_schedule!r}")
+        if self.refer_sink_swap and self.refer_sink_schedule != "constant" and self.refer_sink_op != "lerp":
+            raise ValueError("Progressive refer_sink_schedule requires refer_sink_op='lerp'")
         self.refer_joint_latent = section_get(args, "inference", "refer_joint_latent", False)
         self.refer_joint_use_history = section_get(args, "inference", "refer_joint_use_history", True)
         self.refer_joint_history_source = section_get(args, "inference", "refer_joint_history_source", "global")
@@ -548,6 +560,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 f"[refer-sink] enabled target={self.refer_sink_target} "
                 f"chunks_with_refs={chunks_with_refs} after_chunks={self.refer_sink_after_chunks} "
                 f"injection_chunks={self.refer_sink_injection_chunks} "
+                f"schedule={self.refer_sink_schedule} "
+                f"schedule_alpha={self.refer_sink_schedule_start_alpha}:"
+                f"{self.refer_sink_schedule_end_alpha} "
                 f"presink={self.refer_presink_swap} presink_target={self.refer_presink_target} "
                 f"presink_op={self.refer_presink_op} presink_alpha={self.refer_presink_alpha}"
             )
@@ -583,6 +598,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     f"-> {_prof_trace_path}",
                     flush=True,
                 )
+        # Baselines make scheduled lerp absolute rather than repeatedly blending
+        # an already-modified sink (which would produce nonlinear compounding).
+        self._refer_progressive_bases = {}
         for chunk_index, current_num_frames in enumerate(all_num_frames):
             if _LLV2_TIME:
                 _ev_s = torch.cuda.Event(enable_timing=True)
@@ -640,6 +658,15 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         else:
                             refer_restore = presink_restore
             if self._should_apply_refer_sink(chunk_index, raw_prompts, refer_latents):
+                shot_start_chunk = self._shot_start_for_chunk(raw_prompts, chunk_index)
+                schedule_step = chunk_index - shot_start_chunk - self.refer_sink_after_chunks
+                scheduled_alpha = progressive_refer_alpha(
+                    schedule_step,
+                    self.refer_sink_injection_chunks,
+                    self.refer_sink_schedule_start_alpha,
+                    self.refer_sink_schedule_end_alpha,
+                    self.refer_sink_schedule,
+                )
                 post_restore = self._apply_refer_sink_swap(
                     chunk_refers=refer_latents[chunk_index],
                     conditional_dict=refer_conditional_dict,
@@ -649,8 +676,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     dtype=noise.dtype,
                     device=noise.device,
                     chunk_index=chunk_index,
-                    shot_start_chunk=self._shot_start_for_chunk(raw_prompts, chunk_index),
+                    shot_start_chunk=shot_start_chunk,
                     history_latents=output[:, :cache_start_frame],
+                    alpha_override=(
+                        scheduled_alpha if self.refer_sink_schedule != "constant" else None
+                    ),
+                    progressive_absolute_lerp=self.refer_sink_schedule != "constant",
                 )
                 if post_restore:
                     if refer_restore:
@@ -845,6 +876,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             _path = os.path.join(_LLV2_DUMP_LATENT_DIR, f"latent_{_existing:04d}.pt")
             torch.save(output.detach().cpu(), _path)
             print(f"[LLV2_DUMP] saved latent {tuple(output.shape)} -> {_path}", flush=True)
+
+        # Release absolute-lerp baseline snapshots before VAE decode/return.
+        self._refer_progressive_bases.clear()
 
         # Step 4: Decode the output
 
@@ -1272,6 +1306,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         restore_override=None,
         log_prefix="[refer-sink]",
         history_latents=None,
+        progressive_absolute_lerp=False,
     ):
         if self.quantize_kv:
             raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
@@ -1390,7 +1425,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         dst_slice = slice(dst_start, dst_start + copy_tokens)
         src_slice = slice(0, copy_tokens)
         restore = []
-        for active_cache, temp_cache in ((self.kv_cache_pos, temp_pos), (self.kv_cache_neg, temp_neg)):
+        for cache_index, (active_cache, temp_cache) in enumerate(
+            ((self.kv_cache_pos, temp_pos), (self.kv_cache_neg, temp_neg))
+        ):
             if active_cache is None or temp_cache is None:
                 continue
             snapshot = self._snapshot_kv_slots(active_cache, dst_slice) if restore_slots else None
@@ -1406,11 +1443,25 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         active_block["v"][:, dst_slice] + add_scale * temp_block["v"][:, src_slice]
                     )
                 elif op == "lerp":
+                    if progressive_absolute_lerp:
+                        base_key = (
+                            shot_start_chunk, target, dst_start, copy_tokens,
+                            cache_index, id(active_block),
+                        )
+                        if base_key not in self._refer_progressive_bases:
+                            self._refer_progressive_bases[base_key] = (
+                                active_block["k"][:, dst_slice].clone(),
+                                active_block["v"][:, dst_slice].clone(),
+                            )
+                        base_k, base_v = self._refer_progressive_bases[base_key]
+                    else:
+                        base_k = active_block["k"][:, dst_slice]
+                        base_v = active_block["v"][:, dst_slice]
                     active_block["k"][:, dst_slice] = (
-                        (1.0 - alpha) * active_block["k"][:, dst_slice] + alpha * temp_block["k"][:, src_slice]
+                        (1.0 - alpha) * base_k + alpha * temp_block["k"][:, src_slice]
                     )
                     active_block["v"][:, dst_slice] = (
-                        (1.0 - alpha) * active_block["v"][:, dst_slice] + alpha * temp_block["v"][:, src_slice]
+                        (1.0 - alpha) * base_v + alpha * temp_block["v"][:, src_slice]
                     )
                 else:
                     raise ValueError(f"Unsupported refer sink op={op!r}")
@@ -1427,6 +1478,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             f"joint_latent={self.refer_joint_latent} joint_history="
             f"{self.refer_joint_latent and self.refer_joint_use_history} "
             f"history_source={self.refer_joint_history_source} restore={restore_slots}"
+            f" schedule={self.refer_sink_schedule} absolute_lerp={progressive_absolute_lerp}"
         )
         return restore
 

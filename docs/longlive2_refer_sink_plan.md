@@ -81,6 +81,9 @@ refer_sink_restore: false         # keep the tampered sink for this first experi
 refer_sink_op: replace            # replace | add | lerp
 refer_sink_add_scale: 1.0
 refer_sink_lerp_alpha: 0.5
+refer_sink_schedule: constant     # constant | linear | cosine
+refer_sink_schedule_start_alpha: 0.15
+refer_sink_schedule_end_alpha: 1.0
 refer_prompt_binding: false       # append role/layout binding text to main prompts
 refer_prompt_binding_joint_scene: false
 refer_prompt_binding_use_layout: true
@@ -276,3 +279,35 @@ composer recognizes coarse phrases such as `left`, `right`, `center`,
 `foreground`, `background`, and `held by ... in the left/right hand`. These are
 soft recache priors rather than exact generation constraints. A normalized
 `bbox` remains available only as an expert/debug override.
+
+## D3: same-shot progressive sink recache
+
+To introduce an object without a scene cut, keep refer metadata active for a
+window inside the current shot and target the global sink with an absolute lerp
+schedule. For example, a four-chunk linear window with weights
+`0.10, 0.40, 0.70, 1.00` gradually changes the conditioning seen by generation:
+
+```yaml
+refer_presink_swap: false
+refer_sink_target: global
+refer_sink_after_chunks: 2
+refer_sink_injection_chunks: 4
+refer_sink_op: lerp
+refer_sink_schedule: cosine
+refer_sink_schedule_start_alpha: 0.10
+refer_sink_schedule_end_alpha: 0.85
+refer_sink_restore: false
+```
+
+The scheduled weight is **absolute relative to a snapshot taken at the start
+of the window**. It is not a repeated lerp against an already modified cache,
+which would compound nonlinearly and reach high refer strength too early.
+`cosine` is the recommended first experiment because its slower start and end
+usually produce less visible chunk-boundary change than `linear`.
+
+This is still chunk-level conditioning, so it cannot mathematically guarantee
+pixel-continuous object materialization. Keep camera motion and subject motion
+small during the transition, introduce the object semantically in the prompt
+before the first nonzero alpha, and use a 3--5 chunk window. A future stronger
+solution would additionally blend overlapping output latents or schedule the
+conditioning inside each denoising trajectory.

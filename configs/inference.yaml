@@ -42,6 +42,11 @@ inference:
   refer_sink_op: replace # replace | add | lerp
   refer_sink_add_scale: 1.0
   refer_sink_lerp_alpha: 0.5
+  # Optional same-shot progressive global/shot sink replacement. For linear or
+  # cosine, lerp weights are absolute relative to the sink at window start.
+  refer_sink_schedule: constant # constant | linear | cosine
+  refer_sink_schedule_start_alpha: 0.15
+  refer_sink_schedule_end_alpha: 1.0
   # Optional prompt binding for multi-refer disambiguation.
   refer_prompt_binding: false
   refer_prompt_binding_joint_scene: false
