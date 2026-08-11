@@ -179,13 +179,14 @@ class MultiTextConcatDataset(Dataset):
 
     def _get_dir_item(self, idx):
         folder = self._folders[idx % len(self._folders)]
-        raw_captions, raw_refers = self._load_captions_from_folder(folder)
+        raw_captions, raw_refers, raw_scene_cuts = self._load_captions_from_folder(folder)
         if not raw_captions:
             raw_captions = [""]
             raw_refers = [[]]
+            raw_scene_cuts = [False]
 
         shot_durations = self._resolve_shot_durations(folder, len(raw_captions))
-        prompts = self._apply_shot_durations(raw_captions, shot_durations)
+        prompts = self._apply_shot_durations(raw_captions, shot_durations, raw_scene_cuts)
         refers = self._apply_refer_durations(raw_refers, shot_durations)
 
         # Ensure exactly num_blocks prompts
@@ -210,11 +211,13 @@ class MultiTextConcatDataset(Dataset):
         )
         captions = []
         refers = []
+        scene_cuts = []
         for jf in json_files:
             try:
                 with open(jf, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     captions.append(data.get(self.caption_field, ""))
+                    scene_cuts.append(bool(data.get("scene_cut", not data.get("continue_shot", False))))
                     shot_refers = data.get("refers", [])
                     if shot_refers is None:
                         shot_refers = []
@@ -236,7 +239,10 @@ class MultiTextConcatDataset(Dataset):
             except Exception:
                 captions.append("")
                 refers.append([])
-        return captions, refers
+                scene_cuts.append(True)
+        if scene_cuts:
+            scene_cuts[0] = False
+        return captions, refers, scene_cuts
 
     # ------------------------------------------------------------------
     # shot duration helpers
@@ -269,7 +275,7 @@ class MultiTextConcatDataset(Dataset):
         base, extra = divmod(total, num_shots)
         return [base + (1 if i < extra else 0) for i in range(num_shots)]
 
-    def _apply_shot_durations(self, raw_captions, shot_durations):
+    def _apply_shot_durations(self, raw_captions, shot_durations, scene_cuts=None):
         target = self.num_blocks
         clamped: list[int] = []
         remaining = target
@@ -285,7 +291,8 @@ class MultiTextConcatDataset(Dataset):
         prompts: list[str] = []
         for shot_idx, (caption, duration) in enumerate(zip(raw_captions, clamped)):
             for block_in_shot in range(duration):
-                if shot_idx > 0 and block_in_shot == 0 and self.scene_cut_prefix:
+                is_scene_cut = scene_cuts is None or scene_cuts[shot_idx]
+                if shot_idx > 0 and block_in_shot == 0 and self.scene_cut_prefix and is_scene_cut:
                     prompts.append(self.scene_cut_prefix + caption)
                 else:
                     prompts.append(caption)

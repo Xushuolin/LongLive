@@ -69,6 +69,7 @@ Add these under LongLive2's inference config:
 ```yaml
 refer_sink_swap: false
 refer_sink_after_chunks: 1        # wait until this many chunks of the shot exist
+refer_sink_timing_origin: shot    # shot | refer; refer anchors timing to first refer chunk
 refer_sink_injection_chunks: 1    # keep the subject KV swapped for this many chunks
 refer_sink_start_slot: 0          # SPAWN-aligned default; ablate against slot 1
 refer_sink_num_slots: 0           # 0 means swap all remaining sink slots
@@ -159,6 +160,25 @@ Keep LongLive2's existing multi-shot prompt folder format and add optional
 
 The metadata should be resolved relative to the JSON file directory, matching
 the ShotStream refer-path behavior.
+
+Numbered JSON files are scene boundaries by default for backward compatibility.
+To use a later JSON as a new prompt segment inside the **same continuous shot**,
+set `"scene_cut": false` (or `"continue_shot": true`). Its duration entry in
+`shot_durations.txt` then controls how many chunks use that prompt without
+inserting `<<SCENE_CUT>>`:
+
+```json
+{
+  "caption": "The same host reaches below the table and lifts the referenced bag.",
+  "scene_cut": false,
+  "refers": [{"image_path": "refs/bag.png", "role": "red handbag"}]
+}
+```
+
+For an injection offset relative to the first chunk carrying refer metadata,
+use `refer_sink_timing_origin: refer`. Thus `refer_sink_after_chunks: 2` means
+the third chunk of this in-shot prompt segment, independent of how many chunks
+the preceding JSON segment occupied.
 
 ### Implementation checkpoints inside LongLive2
 

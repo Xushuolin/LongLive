@@ -40,6 +40,31 @@ class ReferMetadataDatasetTest(unittest.TestCase):
             self.assertEqual(batch["refers"][0][2][0]["role"], "identity")
             self.assertEqual(batch["refers"][0][2][1]["role"], "prop")
 
+    def test_continue_shot_does_not_insert_scene_cut_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt_dir = root / "caption" / "sample"
+            prompt_dir.mkdir(parents=True)
+            (prompt_dir / "shot_durations.txt").write_text("2,3", encoding="utf-8")
+            (prompt_dir / "001.json").write_text(
+                json.dumps({"caption": "host waits"}), encoding="utf-8"
+            )
+            (prompt_dir / "002.json").write_text(
+                json.dumps({
+                    "caption": "host lifts bag",
+                    "scene_cut": False,
+                    "refers": [{"image_path": "bag.png", "role": "red handbag"}],
+                }),
+                encoding="utf-8",
+            )
+
+            item = MultiTextConcatDataset(str(root), num_blocks=5)[0]
+            self.assertEqual(item["prompts"], [
+                "host waits", "host waits", "host lifts bag", "host lifts bag", "host lifts bag",
+            ])
+            self.assertEqual(item["refers"][1], [])
+            self.assertEqual(item["refers"][2][0]["role"], "red handbag")
+
 
 if __name__ == "__main__":
     unittest.main()

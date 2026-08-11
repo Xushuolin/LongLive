@@ -114,6 +114,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         )
         self.refer_sink_swap = section_get(args, "inference", "refer_sink_swap", False)
         self.refer_sink_after_chunks = int(section_get(args, "inference", "refer_sink_after_chunks", 1))
+        self.refer_sink_timing_origin = section_get(args, "inference", "refer_sink_timing_origin", "shot")
+        if self.refer_sink_timing_origin not in {"shot", "refer"}:
+            raise ValueError(
+                f"Unsupported refer_sink_timing_origin={self.refer_sink_timing_origin!r}"
+            )
         self.refer_sink_injection_chunks = int(section_get(args, "inference", "refer_sink_injection_chunks", 1))
         self.refer_sink_start_slot = int(section_get(args, "inference", "refer_sink_start_slot", 0))
         self.refer_sink_num_slots = int(section_get(args, "inference", "refer_sink_num_slots", 0))
@@ -659,7 +664,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                             refer_restore = presink_restore
             if self._should_apply_refer_sink(chunk_index, raw_prompts, refer_latents):
                 shot_start_chunk = self._shot_start_for_chunk(raw_prompts, chunk_index)
-                schedule_step = chunk_index - shot_start_chunk - self.refer_sink_after_chunks
+                timing_start_chunk = self._refer_timing_start_for_chunk(
+                    chunk_index, raw_prompts, refer_latents
+                )
+                schedule_step = chunk_index - timing_start_chunk - self.refer_sink_after_chunks
                 scheduled_alpha = progressive_refer_alpha(
                     schedule_step,
                     self.refer_sink_injection_chunks,
@@ -1181,21 +1189,30 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if not self.multi_shot_sink or not self.sink_size:
             print(f"[refer-sink][skip] chunk={chunk_index} has refs but multi_shot_sink/sink_size is disabled")
             return False
-        shot_start = self._shot_start_for_chunk(raw_prompts, chunk_index)
-        chunk_in_shot = chunk_index - shot_start
-        if chunk_in_shot < self.refer_sink_after_chunks:
+        timing_start = self._refer_timing_start_for_chunk(chunk_index, raw_prompts, refer_latents)
+        chunk_in_window = chunk_index - timing_start
+        if chunk_in_window < self.refer_sink_after_chunks:
             print(
-                f"[refer-sink][wait] chunk={chunk_index} chunk_in_shot={chunk_in_shot} "
-                f"after_chunks={self.refer_sink_after_chunks}"
+                f"[refer-sink][wait] chunk={chunk_index} chunk_in_window={chunk_in_window} "
+                f"origin={self.refer_sink_timing_origin} after_chunks={self.refer_sink_after_chunks}"
             )
             return False
-        if chunk_in_shot >= self.refer_sink_after_chunks + self.refer_sink_injection_chunks:
+        if chunk_in_window >= self.refer_sink_after_chunks + self.refer_sink_injection_chunks:
             print(
-                f"[refer-sink][done] chunk={chunk_index} chunk_in_shot={chunk_in_shot} "
-                f"window={self.refer_sink_injection_chunks}"
+                f"[refer-sink][done] chunk={chunk_index} chunk_in_window={chunk_in_window} "
+                f"origin={self.refer_sink_timing_origin} window={self.refer_sink_injection_chunks}"
             )
             return False
         return True
+
+    def _refer_timing_start_for_chunk(self, chunk_index, raw_prompts, refer_latents):
+        shot_start = self._shot_start_for_chunk(raw_prompts, chunk_index)
+        if self.refer_sink_timing_origin == "shot":
+            return shot_start
+        for index in range(shot_start, chunk_index + 1):
+            if index < len(refer_latents) and refer_latents[index]:
+                return index
+        return chunk_index
 
     def _should_apply_presink_refer(self, chunk_index, raw_prompts, refer_latents):
         if not self.refer_presink_swap or refer_latents is None or chunk_index >= len(refer_latents):

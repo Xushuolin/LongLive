@@ -30,6 +30,7 @@ inference:
   # Experimental subject-reference sink swap. Disabled by default.
   refer_sink_swap: false
   refer_sink_after_chunks: 1
+  refer_sink_timing_origin: shot # shot | refer
   refer_sink_injection_chunks: 1
   refer_sink_start_slot: 0
   refer_sink_num_slots: 0 # 0 means all remaining sink slots
