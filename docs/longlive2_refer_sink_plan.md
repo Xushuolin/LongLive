@@ -69,25 +69,75 @@ Add these under LongLive2's inference config:
 ```yaml
 refer_sink_swap: false
 refer_sink_after_chunks: 1        # wait until this many chunks of the shot exist
-refer_sink_start_slot: 1          # keep slot 0 as generated anchor by default
-refer_sink_num_slots: 2           # with sink_size=3, swap slots 1 and 2
-refer_sink_mode: cycle            # cycle | repeat_first
+refer_sink_timing_origin: shot    # shot | refer; refer anchors timing to first refer chunk
+refer_sink_injection_chunks: 1    # keep the subject KV swapped for this many chunks
+refer_sink_start_slot: 0          # SPAWN-aligned default; ablate against slot 1
+refer_sink_num_slots: 0           # 0 means swap all remaining sink slots
+refer_sink_mode: cycle            # cycle | repeat_first; frame selection inside each refer
+refer_sink_multi_mode: interleave # interleave | block | repeat_first; slot allocation across refers
+refer_sink_rope_mode: aligned     # aligned | compact
 refer_sink_rope_start_frame: 0    # compact RoPE id for swapped refer slots
+refer_sink_target: shot           # shot | global | recent
+refer_recent_promote_global_alpha: 0.0 # target=recent only; 0 disables promotion
+refer_sink_restore: false         # keep the tampered sink for this first experiment
+refer_sink_op: replace            # replace | add | lerp
+refer_sink_add_scale: 1.0
+refer_sink_lerp_alpha: 0.5
+refer_sink_schedule: constant     # constant | linear | cosine
+refer_sink_schedule_start_alpha: 0.15
+refer_sink_schedule_end_alpha: 1.0
+refer_prompt_binding: false       # append role/layout binding text to main prompts
+refer_prompt_binding_joint_scene: false
+refer_prompt_binding_use_layout: true
+refer_kv_prompt_binding: false    # use a joint-scene prompt when materializing refer K/V
+refer_joint_latent: false         # spatially compose refs before the temporary KV forward
+refer_joint_use_history: true     # retain generated history in empty canvas regions
+refer_joint_history_source: global # global | recent
+refer_joint_history_frames: 1
+refer_joint_history_strength: 1.0
+refer_joint_alpha: 1.0
+refer_joint_margin: 0.04
+refer_presink_swap: false         # scene-cut chunk warmup before shot sink exists
+refer_presink_target: global      # global | shot | both
+refer_presink_op: lerp            # replace | add | lerp
+refer_presink_alpha: 0.5          # used only by lerp
+refer_presink_add_scale: 1.0      # used only by add
+refer_presink_restore: true
 ```
 
 For the first experiment, use:
 
 ```yaml
 multi_shot_sink: true
-sink_size: 3
+sink_size: 8
 refer_sink_swap: true
 refer_sink_after_chunks: 1
-refer_sink_start_slot: 1
-refer_sink_num_slots: 2
+refer_sink_injection_chunks: 1
+refer_sink_start_slot: 0
+refer_sink_num_slots: 0
 ```
 
-This mirrors the safer ShotStream setting: preserve the first generated sink
-slot and only replace the later sink slots after the shot-level sink exists.
+This mirrors the safer ShotStream setting: wait for the first generated chunk
+to be pinned as the shot sink, then replace that shot sink from the next chunk.
+
+For the first-frame/first-chunk transition experiment, `refer_sink_target: shot`
+cannot affect the scene-cut chunk because the new shot sink is created only
+after that chunk finishes and `_pin_current_chunk` runs. Use the pre-sink path
+to temporarily tamper with the context available before the scene-cut chunk is
+generated:
+
+```yaml
+refer_sink_swap: true
+refer_presink_swap: true
+refer_presink_target: global      # try both for later cuts; global is always present
+refer_presink_op: replace         # strongest visibility test; alpha is ignored
+refer_presink_restore: true       # restore old/global sink after the chunk is generated
+refer_sink_after_chunks: 1
+refer_sink_injection_chunks: 1
+refer_sink_target: shot
+refer_sink_op: replace
+refer_sink_restore: false
+```
 
 ### Suggested prompt / metadata format
 
@@ -112,6 +162,25 @@ Keep LongLive2's existing multi-shot prompt folder format and add optional
 The metadata should be resolved relative to the JSON file directory, matching
 the ShotStream refer-path behavior.
 
+Numbered JSON files are scene boundaries by default for backward compatibility.
+To use a later JSON as a new prompt segment inside the **same continuous shot**,
+set `"scene_cut": false` (or `"continue_shot": true`). Its duration entry in
+`shot_durations.txt` then controls how many chunks use that prompt without
+inserting `<<SCENE_CUT>>`:
+
+```json
+{
+  "caption": "The same host reaches below the table and lifts the referenced bag.",
+  "scene_cut": false,
+  "refers": [{"image_path": "refs/bag.png", "role": "red handbag"}]
+}
+```
+
+For an injection offset relative to the first chunk carrying refer metadata,
+use `refer_sink_timing_origin: refer`. Thus `refer_sink_after_chunks: 2` means
+the third chunk of this in-shot prompt segment, independent of how many chunks
+the preceding JSON segment occupied.
+
 ### Implementation checkpoints inside LongLive2
 
 1. **Dataset / prompt loader**
@@ -130,7 +199,37 @@ the ShotStream refer-path behavior.
    - After `refer_sink_after_chunks`, encode refer frames into a temporary cache.
    - Copy only `refer_sink_start_slot : refer_sink_start_slot + refer_sink_num_slots`
      into the active shot/global sink cache.
+   - Multiple `refers` in the same chunk are now supported.
+     `refer_sink_multi_mode: interleave` alternates sink slots across refers
+     (A/B/A/B for two subjects), `block` assigns contiguous slot blocks
+     (A/A/A/A/B/B/B/B for two subjects with eight slots), and
+     `repeat_first` keeps the previous single-reference behavior.
+   - Optional D1 binding: `refer_prompt_binding` appends role/layout clauses to
+     the main chunk prompt so text tokens explicitly bind each reference to an
+     object. `refer_kv_prompt_binding` keeps the main prompt path separate but
+     materializes refer K/V with a stronger joint-scene prompt, making the
+     temporary sink closer to a single coherent multi-object anchor.
+   - Optional D2 pre-latent recache: `refer_joint_latent` spatially composes all
+     references before one shared DiT forward. User-facing `layout`, `position`,
+     and `relation` text provides a coarse spatial prior; no numeric box is
+     required. Unspecified layouts use a deterministic grid. With
+     `refer_joint_use_history`, unoccupied regions
+     retain the latest clean generated latent frame(s), so old scene identity
+     and new objects interact before a single coherent K/V cache is created.
    - Do not advance global/local cache pointers while copying swapped slots.
+   - Treat the swapped content as the subject image's KV cache, not raw pixels:
+     the reference image is first encoded as a latent, then recached at timestep
+     0 with RoPE aligned to the target sink slots, and only its generated K/V
+     tensors are copied into the sink.
+   - For the first debugging experiment, overwrite all shot-sink slots and do
+     not restore the original sink. Use `refer_sink_op: add` as a follow-up
+     ablation when hard replacement is too destructive.
+   - Optional A3 warmup: on the scene-cut chunk itself, inject refer K/V into
+     the old/global context before the new shot sink exists. `refer_presink_op`
+     supports `replace` (hard overwrite), `add` (residual add using
+     `refer_presink_add_scale`), and `lerp` (weighted blend using
+     `refer_presink_alpha`). Restore that old/global sink after the chunk, then
+     let the normal post-sink replacement take over on the next chunk.
 
 4. **RoPE / text routing**
    - Re-apply compact RoPE to swapped refer sink slots using
@@ -154,3 +253,120 @@ the ShotStream refer-path behavior.
 6. Refer in global sink only vs shot sink only.
 
 The safest default to start with is experiment 4.
+## D2: joint spatial pre-latent recache
+
+This experiment moves fusion earlier than K/V manipulation. Instead of
+materializing each reference independently and combining unrelated K/V, it
+builds one spatial latent canvas and runs that canvas through the DiT once.
+Spatial self-attention can therefore establish object-to-object relationships
+before the resulting K/V replaces the sink.
+
+When `refer_joint_use_history: true`, the canvas starts from clean generated
+latent frames. `refer_joint_history_source: global` uses the first generated
+frames that back the global sink, while `recent` uses the latest shot context.
+Reference patches are then placed into their boxes,
+leaving unoccupied regions as historical scene/identity memory. This is not a
+K/V average: history and references jointly participate in the same recache
+forward.
+
+Recommended first ablation:
+
+```yaml
+refer_joint_latent: true
+refer_joint_use_history: true
+refer_joint_history_source: global
+refer_joint_history_frames: 1
+refer_joint_history_strength: 1.0
+refer_joint_alpha: 1.0
+refer_joint_margin: 0.04
+refer_kv_prompt_binding: true
+refer_presink_swap: true
+refer_presink_target: global
+refer_presink_op: replace
+refer_presink_restore: true
+```
+
+Recommended user-facing semantic binding example:
+
+```json
+"refers": [
+  {"image_path": "refs/woman.png", "role": "the same woman", "layout": "in the center"},
+  {"image_path": "refs/cup.png", "role": "red cup", "relation": "held by the woman in her right hand"}
+]
+```
+
+The binding text is included in the dedicated refer-K/V prompt. The latent
+composer recognizes coarse phrases such as `left`, `right`, `center`,
+`foreground`, `background`, and `held by ... in the left/right hand`. These are
+soft recache priors rather than exact generation constraints. A normalized
+`bbox` remains available only as an expert/debug override.
+
+## D3: same-shot progressive sink recache
+
+To introduce an object without a scene cut, keep refer metadata active for a
+window inside the current shot and target the global sink with an absolute lerp
+schedule. For example, a four-chunk linear window with weights
+`0.10, 0.40, 0.70, 1.00` gradually changes the conditioning seen by generation:
+
+```yaml
+refer_presink_swap: false
+refer_sink_target: global
+refer_sink_after_chunks: 2
+refer_sink_injection_chunks: 4
+refer_sink_op: lerp
+refer_sink_schedule: cosine
+refer_sink_schedule_start_alpha: 0.10
+refer_sink_schedule_end_alpha: 0.85
+refer_sink_restore: false
+```
+
+The scheduled weight is **absolute relative to a snapshot taken at the start
+of the window**. It is not a repeated lerp against an already modified cache,
+which would compound nonlinearly and reach high refer strength too early.
+`cosine` is the recommended first experiment because its slower start and end
+usually produce less visible chunk-boundary change than `linear`.
+
+This is still chunk-level conditioning, so it cannot mathematically guarantee
+pixel-continuous object materialization. Keep camera motion and subject motion
+small during the transition, introduce the object semantically in the prompt
+before the first nonzero alpha, and use a 3--5 chunk window. A future stronger
+solution would additionally blend overlapping output latents or schedule the
+conditioning inside each denoising trajectory.
+
+## D4: recent-memory recache with global promotion
+
+For same-shot object insertion, replacing only the global prefix can be too
+weak because the recent local window still strongly represents the pre-object
+state. `refer_sink_target: recent` instead overwrites the newest available local
+K/V frames (never the protected global prefix) with history-aware Refer K/V.
+The temporary K/V is materialized at the logical RoPE positions of those recent
+frames, rather than at global frame zero.
+
+After recent recache, `refer_recent_promote_global_alpha > 0` performs a second,
+independently RoPE-aligned temporary forward and softly lerps the same joint
+Refer/history memory into the global sink. This separates two responsibilities:
+
+1. recent local recache changes the current same-shot state strongly enough for
+   the object to appear;
+2. low-strength global promotion turns the successfully introduced object into
+   longer-term memory without fully deleting the original identity anchor.
+
+Recommended initial experiment:
+
+```yaml
+refer_sink_target: recent
+refer_sink_after_chunks: 2
+refer_sink_injection_chunks: 2
+refer_sink_op: replace
+refer_sink_restore: false
+refer_joint_latent: true
+refer_joint_use_history: true
+refer_joint_history_source: recent
+refer_joint_history_frames: 8
+refer_recent_promote_global_alpha: 0.15
+```
+
+The recent path is intentionally protected-prefix safe: if fewer than
+`sink_size` local frames exist, it recaches only the available local tokens and
+never writes over the global prefix. This remains an experimental intervention;
+start with fixed camera motion and a single Refer object.
