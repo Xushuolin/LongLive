@@ -38,7 +38,10 @@ inference:
   refer_sink_multi_mode: interleave # interleave | block | repeat_first
   refer_sink_rope_mode: aligned # aligned | compact
   refer_sink_rope_start_frame: 0
-  refer_sink_target: shot # shot | global
+  refer_sink_target: shot # shot | global | recent
+  # When target=recent, optionally recache the global sink at an independently
+  # RoPE-aligned low strength so the new object becomes long-term memory.
+  refer_recent_promote_global_alpha: 0.0
   refer_sink_restore: false
   refer_sink_op: replace # replace | add | lerp
   refer_sink_add_scale: 1.0

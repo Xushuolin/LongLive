@@ -77,7 +77,8 @@ refer_sink_mode: cycle            # cycle | repeat_first; frame selection inside
 refer_sink_multi_mode: interleave # interleave | block | repeat_first; slot allocation across refers
 refer_sink_rope_mode: aligned     # aligned | compact
 refer_sink_rope_start_frame: 0    # compact RoPE id for swapped refer slots
-refer_sink_target: shot           # shot | global
+refer_sink_target: shot           # shot | global | recent
+refer_recent_promote_global_alpha: 0.0 # target=recent only; 0 disables promotion
 refer_sink_restore: false         # keep the tampered sink for this first experiment
 refer_sink_op: replace            # replace | add | lerp
 refer_sink_add_scale: 1.0
@@ -331,3 +332,41 @@ small during the transition, introduce the object semantically in the prompt
 before the first nonzero alpha, and use a 3--5 chunk window. A future stronger
 solution would additionally blend overlapping output latents or schedule the
 conditioning inside each denoising trajectory.
+
+## D4: recent-memory recache with global promotion
+
+For same-shot object insertion, replacing only the global prefix can be too
+weak because the recent local window still strongly represents the pre-object
+state. `refer_sink_target: recent` instead overwrites the newest available local
+K/V frames (never the protected global prefix) with history-aware Refer K/V.
+The temporary K/V is materialized at the logical RoPE positions of those recent
+frames, rather than at global frame zero.
+
+After recent recache, `refer_recent_promote_global_alpha > 0` performs a second,
+independently RoPE-aligned temporary forward and softly lerps the same joint
+Refer/history memory into the global sink. This separates two responsibilities:
+
+1. recent local recache changes the current same-shot state strongly enough for
+   the object to appear;
+2. low-strength global promotion turns the successfully introduced object into
+   longer-term memory without fully deleting the original identity anchor.
+
+Recommended initial experiment:
+
+```yaml
+refer_sink_target: recent
+refer_sink_after_chunks: 2
+refer_sink_injection_chunks: 2
+refer_sink_op: replace
+refer_sink_restore: false
+refer_joint_latent: true
+refer_joint_use_history: true
+refer_joint_history_source: recent
+refer_joint_history_frames: 8
+refer_recent_promote_global_alpha: 0.15
+```
+
+The recent path is intentionally protected-prefix safe: if fewer than
+`sink_size` local frames exist, it recaches only the available local tokens and
+never writes over the global prefix. This remains an experimental intervention;
+start with fixed camera motion and a single Refer object.

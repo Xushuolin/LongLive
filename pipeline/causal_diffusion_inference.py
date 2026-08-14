@@ -22,6 +22,7 @@ from utils.dataset import DEFAULT_SCENE_CUT_PREFIX
 from utils.config import section_get, wan_default_config
 from utils.refer_latent import compose_joint_refer_latent
 from utils.refer_schedule import progressive_refer_alpha
+from utils.refer_cache import recent_cache_region
 from utils.i2v_conditioning import (
     _overwrite_i2v_context,
     _zero_i2v_context_timestep,
@@ -127,6 +128,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.refer_sink_rope_mode = section_get(args, "inference", "refer_sink_rope_mode", "aligned")
         self.refer_sink_rope_start_frame = int(section_get(args, "inference", "refer_sink_rope_start_frame", 0))
         self.refer_sink_target = section_get(args, "inference", "refer_sink_target", "shot")
+        self.refer_recent_promote_global_alpha = float(
+            section_get(args, "inference", "refer_recent_promote_global_alpha", 0.0)
+        )
+        if not 0.0 <= self.refer_recent_promote_global_alpha <= 1.0:
+            raise ValueError("refer_recent_promote_global_alpha must be within [0, 1]")
         self.refer_sink_restore = section_get(args, "inference", "refer_sink_restore", False)
         self.refer_sink_op = section_get(args, "inference", "refer_sink_op", "replace")
         self.refer_sink_add_scale = float(section_get(args, "inference", "refer_sink_add_scale", 1.0))
@@ -568,6 +574,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 f"schedule={self.refer_sink_schedule} "
                 f"schedule_alpha={self.refer_sink_schedule_start_alpha}:"
                 f"{self.refer_sink_schedule_end_alpha} "
+                f"promote_global_alpha={self.refer_recent_promote_global_alpha} "
                 f"presink={self.refer_presink_swap} presink_target={self.refer_presink_target} "
                 f"presink_op={self.refer_presink_op} presink_alpha={self.refer_presink_alpha}"
             )
@@ -690,12 +697,37 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         scheduled_alpha if self.refer_sink_schedule != "constant" else None
                     ),
                     progressive_absolute_lerp=self.refer_sink_schedule != "constant",
+                    current_start_frame=current_start_frame,
                 )
                 if post_restore:
                     if refer_restore:
                         refer_restore.extend(post_restore)
                     else:
                         refer_restore = post_restore
+                if self.refer_sink_target == "recent" and self.refer_recent_promote_global_alpha > 0.0:
+                    global_restore = self._apply_refer_sink_swap(
+                        chunk_refers=refer_latents[chunk_index],
+                        conditional_dict=refer_conditional_dict,
+                        unconditional_dict=unconditional_dict,
+                        use_cfg=use_cfg,
+                        batch_size=batch_size,
+                        dtype=noise.dtype,
+                        device=noise.device,
+                        chunk_index=chunk_index,
+                        shot_start_chunk=shot_start_chunk,
+                        target_override="global",
+                        op_override="lerp",
+                        alpha_override=self.refer_recent_promote_global_alpha,
+                        restore_override=False,
+                        log_prefix="[refer-promote-global]",
+                        history_latents=output[:, :cache_start_frame],
+                        current_start_frame=current_start_frame,
+                    )
+                    if global_restore:
+                        if refer_restore:
+                            refer_restore.extend(global_restore)
+                        else:
+                            refer_restore = global_restore
 
             first_i2v_block = clamp_i2v_first_chunk and chunk_index == 0
             noise_start_frame = (
@@ -1324,6 +1356,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         log_prefix="[refer-sink]",
         history_latents=None,
         progressive_absolute_lerp=False,
+        current_start_frame=None,
     ):
         if self.quantize_kv:
             raise NotImplementedError("refer_sink_swap currently supports only non-quantized BF16 KV cache.")
@@ -1332,8 +1365,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         alpha = self.refer_sink_lerp_alpha if alpha_override is None else alpha_override
         add_scale = self.refer_sink_add_scale if add_scale_override is None else add_scale_override
         restore_slots = self.refer_sink_restore if restore_override is None else restore_override
-        if target not in {"shot", "global"}:
-            raise ValueError(f"refer sink target must be 'shot' or 'global', got {target!r}")
+        if target not in {"shot", "global", "recent"}:
+            raise ValueError(
+                f"refer sink target must be 'shot', 'global', or 'recent', got {target!r}"
+            )
 
         max_slots = max(0, self.sink_size - self.refer_sink_start_slot)
         requested_slots = self.refer_sink_num_slots
@@ -1344,13 +1379,29 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if target == "global":
             dst_start = self.refer_sink_start_slot * self.frame_seq_length
             aligned_frame = self.refer_sink_start_slot
-        else:
+        elif target == "shot":
             pin_start = int(self.kv_cache_pos[0]["pinned_start"].item())
             if pin_start < 0:
                 print(f"[refer-sink][skip] shot sink is not pinned yet at chunk={chunk_index}")
                 return None
             dst_start = pin_start + self.refer_sink_start_slot * self.frame_seq_length
             aligned_frame = shot_start_chunk * self.num_frame_per_block + self.refer_sink_start_slot
+        else:
+            if current_start_frame is None:
+                raise ValueError("current_start_frame is required for recent refer recache")
+            requested_tokens = num_slots * self.frame_seq_length
+            global_tokens = self.global_sink_size * self.frame_seq_length
+            local_end = int(self.kv_cache_pos[0]["local_end_index"].item())
+            dst_start, copy_tokens = recent_cache_region(
+                local_end, global_tokens, requested_tokens
+            )
+            num_slots = copy_tokens // self.frame_seq_length
+            copy_tokens = num_slots * self.frame_seq_length
+            dst_start = local_end - copy_tokens
+            if num_slots <= 0:
+                print(f"[refer-sink][skip] no recent local cache is available at chunk={chunk_index}")
+                return None
+            aligned_frame = max(0, current_start_frame - num_slots)
 
         if self.refer_sink_rope_mode == "aligned":
             refer_start_frame = aligned_frame
